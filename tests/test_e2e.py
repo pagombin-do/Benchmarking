@@ -207,3 +207,83 @@ def test_run_refuses_missing_dataset(fake_env, spec_file, results_dir, monkeypat
     assert rc == 2
     err = capsys.readouterr().err
     assert "prepare" in err  # tells the user what to do next
+
+
+def test_dataset_size_mismatch_aborts(fake_env, spec_file, results_dir, monkeypatch, capsys) -> None:
+    """Spec says table_size 1000 but the cluster holds 2000 rows -> hard abort."""
+    monkeypatch.setenv("FAKE_PSQL_MAX_ID", "2000")
+    assert run_cli("preflight", "--spec", str(spec_file)) == 2
+    err = capsys.readouterr().err
+    assert "mismatch" in err
+    assert "2000" in err and "1000" in err
+    assert "re-prepare" in err or "prepare" in err
+    # run and prepare must refuse too (prepare never loads on top)
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 2
+    assert run_cli("prepare", "--spec", str(spec_file),
+                   "--results-dir", str(results_dir)) == 2
+
+
+def test_incomplete_dataset_aborts(fake_env, spec_file, monkeypatch, capsys) -> None:
+    """Some expected tables exist but not all -> abort with cleanup hint."""
+    monkeypatch.setenv("FAKE_PSQL_TABLES", "3")  # spec expects 9 sbtest tables
+    assert run_cli("preflight", "--spec", str(spec_file)) == 2
+    err = capsys.readouterr().err
+    assert "3 of 9" in err
+
+
+def test_unrecognized_canary_schema_aborts(fake_env, spec_file, monkeypatch, capsys) -> None:
+    """sbtest1 exists but with someone else's columns -> abort, never overwrite."""
+    monkeypatch.setenv("FAKE_PSQL_CANARY_COLS", "1")
+    assert run_cli("preflight", "--spec", str(spec_file)) == 2
+    err = capsys.readouterr().err
+    assert "not created by this tool" in err or "unrecognized schema" in err
+
+
+def test_foreign_tables_warning(fake_env, spec_file, capsys, monkeypatch) -> None:
+    monkeypatch.setenv("FAKE_PSQL_FOREIGN", "5")
+    assert run_cli("preflight", "--spec", str(spec_file)) == 0  # warns, not fatal
+    out = capsys.readouterr().out
+    assert "non-benchmark table(s)" in out
+    assert "dedicated database" in out
+
+
+def test_prepare_records_load_metrics(
+    fake_env: Path, spec_file, results_dir, monkeypatch
+) -> None:
+    """prepare loads when missing, records wall time / DB size / throughput."""
+    monkeypatch.setenv("FAKE_PSQL_TABLES", "0")  # nothing loaded yet
+    assert run_cli("prepare", "--spec", str(spec_file),
+                   "--results-dir", str(results_dir)) == 0
+    stats_files = list(results_dir.glob("prepare_*.json"))
+    assert len(stats_files) == 1
+    stats = json.loads(stats_files[0].read_text())
+    assert stats["db_size_bytes"] == 1073741824
+    assert stats["db_size_pretty"] == "1.00 GiB"
+    assert stats["wall_s"] >= 0
+    assert stats["loaded_units"] == "9,000 rows"  # 9 tables x 1000
+    assert stats["workload"]["type"] == "oltp_read_write"
+    # marker written by fake sysbench: dataset now reads as loaded
+    assert run_cli("preflight", "--spec", str(spec_file)) == 0
+
+
+def test_report_includes_data_load_section(
+    fake_env: Path, spec_file, results_dir, monkeypatch
+) -> None:
+    monkeypatch.setenv("FAKE_PSQL_TABLES", "0")
+    assert run_cli("prepare", "--spec", str(spec_file),
+                   "--results-dir", str(results_dir)) == 0
+    monkeypatch.delenv("FAKE_PSQL_TABLES")
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 0
+    run_dir = find_run_dir(results_dir)
+    assert (run_dir / "env" / "prepare_stats.json").exists()
+    html = (run_dir / "report.html").read_text()
+    assert "Data load" in html
+    assert "1.00 GiB" in html
+
+
+def test_report_kpi_cards(fake_env, spec_file, results_dir) -> None:
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 0
+    html = (find_run_dir(results_dir) / "report.html").read_text()
+    assert "Peak QPS" in html
+    assert "p99 latency at peak" in html
+    assert "Failed levels / SQL errors" in html

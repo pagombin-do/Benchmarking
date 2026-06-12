@@ -2,11 +2,18 @@
 """Fake psql for end-to-end tests.
 
 Knobs (env vars):
-  FAKE_PSQL_TABLES     table count reported for information_schema (default 9)
-  FAKE_PSQL_ROWS       row count reported for the sanity table (default 1000)
+  FAKE_PSQL_TABLES     expected-table count reported (default: all expected;
+                       also forced to "all" once the prepared marker exists)
+  FAKE_PSQL_FOREIGN    count of non-benchmark tables (default 0)
+  FAKE_PSQL_ROWS       warehouse1 row count for tpcc scale checks (default 30)
+  FAKE_PSQL_MAX_ID     max(id) of sbtest1 for oltp size checks (default 1000)
+  FAKE_PSQL_CANARY_COLS override the canary column-count answer
   FAKE_PSQL_MAX_CONN   simulate a pooler ceiling: pg_sleep connections beyond
                        this count are refused with PgBouncer's error.
                        Requires FAKE_PSQL_STATE (a writable directory).
+
+A `prepared` marker file in FAKE_PSQL_STATE (written by the fake sysbench's
+`prepare`) makes the dataset look fully loaded regardless of FAKE_PSQL_TABLES.
 """
 import fcntl
 import os
@@ -53,6 +60,15 @@ if "pg_sleep" in low:
     print("")
     sys.exit(0)
 
+def names_in_list(sql_text):
+    """Count quoted names inside the first IN (...) list of the statement."""
+    m = re.search(r"in \(([^)]*)\)", sql_text)
+    return len(re.findall(r"'[^']*'", m.group(1))) if m else 0
+
+
+state_dir = os.environ.get("FAKE_PSQL_STATE", "")
+prepared = state_dir and os.path.exists(os.path.join(state_dir, "prepared"))
+
 if "select version()" in low:
     print("PostgreSQL 16.4 on x86_64-pc-linux-gnu, compiled by gcc 13.2.0, 64-bit")
 elif "show server_version" in low:
@@ -64,8 +80,19 @@ elif "show pool_mode" in low:
     sys.exit(1)
 elif "pg_extension" in low:
     print("0")
+elif "information_schema.tables" in low and "not in" in low:
+    print(os.environ.get("FAKE_PSQL_FOREIGN", "0"))
 elif "information_schema.tables" in low:
-    print(os.environ.get("FAKE_PSQL_TABLES", "9"))
+    if prepared:
+        print(names_in_list(low))
+    else:
+        print(os.environ.get("FAKE_PSQL_TABLES", str(names_in_list(low))))
+elif "information_schema.columns" in low:
+    print(os.environ.get("FAKE_PSQL_CANARY_COLS", str(names_in_list(low))))
+elif "max(id) from sbtest1" in low:
+    print(os.environ.get("FAKE_PSQL_MAX_ID", "1000"))
+elif "pg_database_size" in low:
+    print("1073741824")
 elif "pg_stat_bgwriter" in low:
     print('{"checkpoints_timed":12,"checkpoints_req":3,"buffers_clean":4567}')
 elif "pg_stat_statements" in low:
@@ -87,8 +114,8 @@ elif "copy (select name, setting, unit, source from pg_settings" in low:
     ]
     for r in rows:
         print(",".join(r))
-elif re.search(r"select count\(\*\) from (warehouse1|sbtest1)", low):
-    print(os.environ.get("FAKE_PSQL_ROWS", "1000"))
+elif "count(*) from warehouse1" in low:
+    print(os.environ.get("FAKE_PSQL_ROWS", "30"))
 elif low.startswith("select count(*)"):
     print("0")
 else:

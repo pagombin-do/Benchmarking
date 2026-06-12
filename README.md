@@ -9,7 +9,7 @@ per run plus cross-run comparison reports.
 
 ```
 pgbench-harness preflight   --spec run.yaml        # connectivity, version, limits checks
-pgbench-harness prepare     --spec run.yaml        # load the dataset (idempotent)
+pgbench-harness prepare     --spec run.yaml        # load the dataset (idempotent, records load metrics)
 pgbench-harness run         --spec run.yaml        # execute the sweep(s), capture everything, report
 pgbench-harness report      --run-dir results/<run_id>/   # regenerate the HTML report
 pgbench-harness compare     --runs <run_id> <run_id> --out compare.html
@@ -167,9 +167,40 @@ contains it.
    preflight aborts within seconds reporting how many connections succeeded,
    the (launch-order) index of the first refused connection, and the verbatim
    server error — instead of failing mid-sweep hours later.
-4. Verifies dataset presence (expected table count + a row-count sanity check
-   on `warehouse1`/`sbtest1`). If absent, you are told to run `prepare`;
-   `run` refuses to prepare silently.
+4. Verifies the dataset is present **and conforms to the spec**:
+   * every expected benchmark table exists *by name* (`warehouse1..N` × 9
+     tpcc tables, or `sbtest1..N`) — unrelated tables can never satisfy the
+     check;
+   * the canary table (`warehouse1`/`sbtest1`) has the columns the workload's
+     schema defines — a same-named foreign table aborts with a clear message
+     rather than being benchmarked or overwritten;
+   * the loaded **size matches the spec**: tpcc warehouse count must equal
+     `scale` exactly; oltp `max(id)` must be within ±10% of `table_size`.
+     Changing `scale: 30` → `scale: 60` against an already-loaded cluster
+     therefore aborts ("found 30, spec configures 60") instead of silently
+     benchmarking the wrong dataset — drop the tables (or use a fresh
+     database) and `prepare` again. The harness never reloads or "tops up"
+     on top of existing data;
+   * non-benchmark tables in `public` produce a **warning** (shared-database
+     contention risk), recorded in the manifest and shown in the report.
+
+   If the dataset is simply absent, you are told to run `prepare`; `run`
+   refuses to prepare silently. Preflight also warns when
+   `max(sweep.threads)` exceeds 8× the load generator's CPU count (loadgen
+   bottleneck risk).
+
+### Prepare and load metrics
+
+`prepare` is idempotent: if the dataset already exists *and matches the spec*
+it does nothing; if it conflicts (wrong size, partial load, unrecognized
+schema) it aborts with the same messages as preflight. When it does load, it
+records **data-load metrics** to `results/prepare_<host>-<db>.json`: load
+wall time, database size after load (`pg_database_size`), derived MB/s
+throughput, rows/warehouses loaded, and the thread count used. The next `run`
+against the same target+workload attaches these to `env/prepare_stats.json`
+and the report shows a "Data load" card. (sysbench's prepare phase emits no
+per-second metrics, so latency percentiles are not available for the load —
+only aggregate throughput.)
 
 ### Run
 
@@ -267,8 +298,12 @@ resume logic, spec validation, and the password-leak test.
 * **Prepare parallelism:** `prepare` uses `min(16, max(sweep.threads))`
   sysbench threads.
 * **Dataset check:** tpcc creates 9 tables per table-set, so the expected
-  table count is `tables × 9` (oltp: `tables`); the row-count sanity check
-  probes `warehouse1` / `sbtest1`.
+  tables are `warehouse1..N` etc. (`tables × 9` names) and oltp `sbtest1..N`;
+  size conformance uses `count(*)` on `warehouse1` (tiny) for tpcc and
+  `max(id)` on `sbtest1` (index-only, instant) with ±10% tolerance for oltp —
+  R/W workloads can drift row ids slightly, but a misconfigured 2× dataset is
+  always caught. The harness assumes a dedicated database and warns when it
+  detects foreign tables.
 * **samples format:** CSV (not parquet) to keep dependencies minimal
   (`pyyaml`, `jinja2`, `matplotlib` only); pandas is not required.
 * **Ceiling probe accounting:** holders are launched in order with a 10 ms

@@ -56,6 +56,24 @@ class ProbeResult:
 
 
 @dataclass
+class DatasetCheck:
+    """Outcome of the dataset conformance check (presence AND size vs spec)."""
+
+    status: str = "error"  # ok | missing | incomplete | mismatch | error
+    detail: str = ""
+    expected_tables: int = 0
+    present_tables: int = 0
+    foreign_tables: int = 0
+    expected_size: int = 0
+    actual_size: Optional[int] = None
+    size_unit: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
+@dataclass
 class PreflightResult:
     """Everything preflight learned, recorded into the run manifest/env."""
 
@@ -67,10 +85,9 @@ class PreflightResult:
     max_connections: str = ""
     pooler_probe: str = ""
     pg_stat_statements: bool = False
-    dataset_ok: bool = False
-    dataset_detail: str = ""
+    dataset: Optional[DatasetCheck] = None
     probe: Optional[ProbeResult] = None
-    checks: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def _psql_argv(spec: Spec, sql: str) -> list[str]:
@@ -226,35 +243,132 @@ def connection_ceiling_probe(
                 p.kill()
 
 
-def check_dataset(spec: Spec, password: str) -> tuple[bool, str]:
-    """Verify dataset presence: expected table count and a row-count sanity check.
+TPCC_TABLE_BASES = (
+    "warehouse", "district", "customer", "history", "orders",
+    "new_orders", "order_line", "stock", "item",
+)
+OLTP_SIZE_TOLERANCE = 0.10  # oltp row counts may drift slightly under R/W load
 
-    tpcc creates 9 tables per table set (warehouse1..N, etc.); oltp_* creates
-    `tables` sbtest tables. We check the public-schema table count and that
-    one known table is non-empty.
-    """
+
+def expected_table_names(spec: Spec) -> list[str]:
+    """The exact benchmark tables the configured workload owns."""
     w = spec.workload
-    expected = w.tables * 9 if w.type == "tpcc" else w.tables
-    probe_table = "warehouse1" if w.type == "tpcc" else "sbtest1"
-    ok, out = psql_query_soft(
+    if w.type == "tpcc":
+        return [f"{base}{i}" for i in range(1, w.tables + 1) for base in TPCC_TABLE_BASES]
+    return [f"sbtest{i}" for i in range(1, w.tables + 1)]
+
+
+def _count_query(spec: Spec, password: str, sql: str) -> Optional[int]:
+    ok, out = psql_query_soft(spec, password, sql)
+    return int(out) if ok and out.lstrip("-").isdigit() else None
+
+
+def database_size_bytes(spec: Spec, password: str) -> Optional[int]:
+    """Current size of the target database in bytes (best effort)."""
+    return _count_query(
+        spec, password, "SELECT pg_database_size(current_database())")
+
+
+def _check_canary_schema(spec: Spec, password: str) -> tuple[bool, str]:
+    """Verify the canary table has the columns the workload's schema defines."""
+    cols: tuple[str, ...]
+    if spec.workload.type == "tpcc":
+        table, cols = "warehouse1", ("w_id", "w_ytd")
+    else:
+        table, cols = "sbtest1", ("id", "k", "c", "pad")
+    quoted = ", ".join(f"'{c}'" for c in cols)
+    n = _count_query(
         spec, password,
-        "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'",
+        f"SELECT count(*) FROM information_schema.columns "
+        f"WHERE table_schema='public' AND table_name='{table}' "
+        f"AND column_name IN ({quoted})",
     )
-    if not ok:
-        return False, f"could not count tables: {out}"
-    try:
-        n_tables = int(out)
-    except ValueError:
-        return False, f"unexpected table-count output: {out!r}"
-    if n_tables < expected:
+    if n != len(cols):
         return False, (
-            f"found {n_tables} tables in schema 'public' but the workload expects "
-            f">= {expected}"
+            f"table '{table}' exists but does not have the expected {spec.workload.type} "
+            f"columns ({', '.join(cols)}) — it was probably not created by this tool"
         )
-    ok, out = psql_query_soft(spec, password, f"SELECT count(*) FROM {probe_table}")
-    if not ok or not out.isdigit() or int(out) <= 0:
-        return False, f"sanity table '{probe_table}' is missing or empty"
-    return True, f"{n_tables} tables present; {probe_table} has {out} rows"
+    return True, ""
+
+
+def _check_dataset_size(spec: Spec, password: str, chk: DatasetCheck) -> None:
+    """Compare loaded dataset size against the spec; sets mismatch status."""
+    w = spec.workload
+    if w.type == "tpcc":
+        chk.expected_size = w.scale
+        chk.size_unit = "warehouses per table-set"
+        chk.actual_size = _count_query(
+            spec, password, "SELECT count(*) FROM warehouse1")
+        bad = chk.actual_size != w.scale
+    else:
+        chk.expected_size = w.table_size
+        chk.size_unit = "rows in sbtest1"
+        chk.actual_size = _count_query(spec, password, "SELECT max(id) FROM sbtest1")
+        bad = (
+            chk.actual_size is None
+            or abs(chk.actual_size - w.table_size) > w.table_size * OLTP_SIZE_TOLERANCE
+        )
+    if bad:
+        chk.status = "mismatch"
+        chk.detail = (
+            f"dataset size does not match the spec: found {chk.actual_size} "
+            f"{chk.size_unit}, but the spec configures {chk.expected_size}. "
+            "The harness never reloads or tops up on top of an existing dataset."
+        )
+
+
+def check_dataset(spec: Spec, password: str) -> DatasetCheck:
+    """Verify the dataset is present AND conforms to the spec's configured size.
+
+    Checks, in order: every expected benchmark table exists (by name, so
+    unrelated tables can't satisfy the check), the canary table has the
+    expected schema, and the loaded size matches `scale`/`table_size`
+    (tpcc: exact warehouse count; oltp: ±10% on max(id), since R/W runs may
+    drift row ids slightly). Also counts foreign (non-benchmark) tables so
+    callers can warn about shared databases.
+    """
+    names = expected_table_names(spec)
+    quoted = ", ".join(f"'{n}'" for n in names)
+    chk = DatasetCheck(expected_tables=len(names))
+    present = _count_query(
+        spec, password,
+        f"SELECT count(*) FROM information_schema.tables "
+        f"WHERE table_schema='public' AND table_name IN ({quoted})",
+    )
+    if present is None:
+        chk.detail = "could not query information_schema (connectivity/permissions?)"
+        return chk
+    chk.present_tables = present
+    chk.foreign_tables = _count_query(
+        spec, password,
+        f"SELECT count(*) FROM information_schema.tables "
+        f"WHERE table_schema='public' AND table_type='BASE TABLE' "
+        f"AND table_name NOT IN ({quoted})",
+    ) or 0
+    if present == 0:
+        chk.status = "missing"
+        chk.detail = f"none of the {len(names)} expected benchmark tables exist"
+        return chk
+    if present < len(names):
+        chk.status = "incomplete"
+        chk.detail = (
+            f"only {present} of {len(names)} expected benchmark tables exist — "
+            "a previous load was interrupted, or the spec's `tables` changed"
+        )
+        return chk
+    schema_ok, schema_err = _check_canary_schema(spec, password)
+    if not schema_ok:
+        chk.status = "incomplete"
+        chk.detail = schema_err
+        return chk
+    chk.status = "ok"
+    _check_dataset_size(spec, password, chk)
+    if chk.ok:
+        chk.detail = (
+            f"all {len(names)} benchmark tables present; "
+            f"{chk.actual_size} {chk.size_unit} (matches spec)"
+        )
+    return chk
 
 
 def detect_pooler(spec: Spec, password: str) -> str:
@@ -342,9 +456,30 @@ def run_preflight(spec: Spec, password: str, logger: logging.Logger) -> Prefligh
     logger.info("preflight: pooler probe: %s", pf.pooler_probe)
     _check_pg_stat_statements(spec, password, pf)
     _check_ceiling(spec, password, pf, logger)
-    pf.dataset_ok, pf.dataset_detail = check_dataset(spec, password)
-    logger.info("preflight: dataset: %s", pf.dataset_detail)
+    pf.dataset = check_dataset(spec, password)
+    logger.info("preflight: dataset [%s]: %s", pf.dataset.status, pf.dataset.detail)
+    _collect_warnings(spec, pf)
+    for w in pf.warnings:
+        logger.warning("preflight: %s", w)
     return pf
+
+
+def _collect_warnings(spec: Spec, pf: PreflightResult) -> None:
+    """Non-fatal conditions worth surfacing in logs, manifest and report."""
+    cpus = os.cpu_count() or 1
+    max_threads = max(spec.sweep.threads)
+    if max_threads > cpus * 8:
+        pf.warnings.append(
+            f"sweep peaks at {max_threads} client threads but this load generator "
+            f"has only {cpus} CPUs — the loadgen itself may become the bottleneck "
+            "at high thread counts (check host_info.txt when interpreting results)"
+        )
+    if pf.dataset and pf.dataset.foreign_tables:
+        pf.warnings.append(
+            f"{pf.dataset.foreign_tables} non-benchmark table(s) exist in schema "
+            "'public' — this database is shared, so cache/disk contention from "
+            "that data may pollute results; a dedicated database is recommended"
+        )
 
 
 def _check_pg_stat_statements(spec: Spec, password: str, pf: PreflightResult) -> None:

@@ -68,7 +68,10 @@ def chart_overlay(runs: list[dict[str, Any]], metric: str, title: str, ylabel: s
 
 
 def build_table(runs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Side-by-side headline table over the union of thread ladders (gaps allowed)."""
+    """Side-by-side headline table over the union of thread ladders (gaps allowed).
+
+    For exactly two runs, a Δ QPS % column (second run vs first) is included.
+    """
     threads = sorted({t for r in runs for t in _mean_by_threads(r, "qps_avg")})
     rows = []
     for t in threads:
@@ -77,8 +80,11 @@ def build_table(runs: list[dict[str, Any]]) -> dict[str, Any]:
             qps = _mean_by_threads(r, "qps_avg").get(t)
             p99 = _mean_by_threads(r, "lat_p99").get(t)
             cells.append({"qps": qps, "p99": p99})
-        rows.append({"threads": t, "cells": cells})
-    return {"threads": threads, "rows": rows}
+        delta = None
+        if len(runs) == 2 and cells[0]["qps"] and cells[1]["qps"] is not None:
+            delta = (cells[1]["qps"] - cells[0]["qps"]) / cells[0]["qps"] * 100
+        rows.append({"threads": t, "cells": cells, "delta_pct": delta})
+    return {"threads": threads, "rows": rows, "with_delta": len(runs) == 2}
 
 
 def settings_diff(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:

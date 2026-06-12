@@ -23,10 +23,27 @@ from pgbench_harness.spec import Spec, load_spec  # noqa: E402
 from pgbench_harness.summarize import write_parsed  # noqa: E402
 from pgbench_harness.util import fmt_duration  # noqa: E402
 
-REP_COLORS = ["#7aa6d6", "#d6a37a", "#9fd67a", "#c97ad6"]
-MEAN_COLOR = "#1f4e79"
+REP_COLORS = ["#7fb2f0", "#f0a37f", "#8fd6a5", "#c79fe0"]
+MEAN_COLOR = "#0061eb"
+PCT_COLORS = {"p50": "#2eb67d", "p95": "#e8a33d", "p99": "#d6453d"}
 FIGSIZE = (11.0, 4.8)
 DPI = 120
+
+matplotlib.rcParams.update({
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.edgecolor": "#aab4c0",
+    "axes.labelcolor": "#2b3440",
+    "axes.titlecolor": "#16202b",
+    "axes.titleweight": "bold",
+    "grid.color": "#dfe5ec",
+    "grid.linewidth": 0.8,
+    "xtick.color": "#5b6573",
+    "ytick.color": "#5b6573",
+    "font.family": "sans-serif",
+    "font.sans-serif": ["DejaVu Sans", "Helvetica", "Arial"],
+    "figure.facecolor": "white",
+})
 
 
 def _jinja_env() -> Environment:
@@ -80,13 +97,17 @@ def chart_metric_vs_threads(summary: dict[str, Any], metric: str, title: str, yl
             ax.plot(*zip(*pts), marker="o", linewidth=1.4, alpha=0.75,
                     color=REP_COLORS[rep_i % len(REP_COLORS)], label=f"rep {rep}")
     mean_pts = sorted((t, statistics.fmean(vs)) for t, vs in by_threads.items())
-    ax.plot(*zip(*mean_pts), marker="o", linewidth=2.4, color=MEAN_COLOR,
-            label="mean" if len(reps) > 1 else None)
+    ax.plot(*zip(*mean_pts), marker="o", linewidth=2.6, color=MEAN_COLOR,
+            label="mean" if len(reps) > 1 else None, zorder=5)
+    peak_t, peak_v = max(mean_pts, key=lambda p: p[1])
+    ax.annotate(f"peak {peak_v:,.0f}", xy=(peak_t, peak_v), xytext=(0, 12),
+                textcoords="offset points", ha="center", fontsize=12,
+                fontweight="bold", color=MEAN_COLOR)
     _style_ax(ax, title, "client threads (log scale)", ylabel)
     _log_x(ax, sorted(by_threads))
     if len(reps) > 1:
         ax.legend(fontsize=12)
-    ax.set_ylim(bottom=0)
+    ax.set_ylim(bottom=0, top=peak_v * 1.18)
     return fig_to_base64(fig)
 
 
@@ -107,7 +128,8 @@ def chart_latency_vs_threads(summary: dict[str, Any]) -> Optional[str]:
         if not by_threads:
             continue
         pts = sorted((t, statistics.fmean(vs)) for t, vs in by_threads.items())
-        ax.plot(*zip(*pts), marker="o", linewidth=2.0, label=f"p{p}")
+        ax.plot(*zip(*pts), marker="o", linewidth=2.2, label=f"p{p}",
+                color=PCT_COLORS.get(f"p{p}"))
         threads_all.update(by_threads)
         plotted = True
     if not plotted:
@@ -209,6 +231,38 @@ def build_error_sections(summary: dict[str, Any], samples: list[dict[str, Any]])
     }
 
 
+def build_kpis(headline: list[dict[str, Any]], summary: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Headline KPI cards: peak throughput, latency at peak, error totals."""
+    ok_rows = [r for r in headline if "qps" in r]
+    if not ok_rows:
+        return None
+    peak = max(ok_rows, key=lambda r: r["qps"])
+    failed = sum(1 for l in summary["levels"] if l["status"] != STATUS_OK)
+    errors = sum(l.get("errors") or 0 for l in summary["levels"]
+                 if l["status"] == STATUS_OK)
+    return {
+        "peak_qps": peak["qps"],
+        "peak_tps": peak["tps"],
+        "peak_threads": peak["threads"],
+        "p99_at_peak": peak.get("lat_p99"),
+        "failed_levels": failed,
+        "total_errors": errors,
+    }
+
+
+def load_prepare_stats(env_dir: Path) -> Optional[dict[str, Any]]:
+    """Data-load metrics recorded by `prepare`, when attached to this run."""
+    path = env_dir / "prepare_stats.json"
+    if not path.exists():
+        return None
+    try:
+        import json
+
+        return dict(json.loads(path.read_text(encoding="utf-8")))
+    except (ValueError, OSError):
+        return None
+
+
 def load_pg_settings(env_dir: Path) -> list[dict[str, str]]:
     """Read env/pg_settings.csv into rows (empty list when not captured)."""
     path = env_dir / "pg_settings.csv"
@@ -246,12 +300,16 @@ def generate_report(run_dir: Path) -> Path:
             for t in spec.report.timeseries_levels
         ],
     }
+    headline = build_headline_rows(summary, spec)
     html = _jinja_env().get_template("report.html.j2").render(
         manifest=manifest,
         spec=spec,
         summary=summary,
         percentiles=summary.get("percentiles", [50, 95, 99]),
-        headline=build_headline_rows(summary, spec),
+        headline=headline,
+        kpis=build_kpis(headline, summary),
+        prepare_stats=load_prepare_stats(env_dir),
+        warnings=manifest.preflight.get("warnings", []),
         errors=build_error_sections(summary, samples),
         charts=charts,
         key_settings=[settings_map.get(k, {"name": k, "setting": "n/a", "unit": "", "source": ""})
