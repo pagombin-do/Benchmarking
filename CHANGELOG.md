@@ -2,6 +2,17 @@
 
 ## Unreleased — operator console (incremental)
 
+- **Phase 6 — reports (interactive view + CSV/print, offline kept):** the report
+  page is now tabbed — an **Interactive** in-app view (KPI band; QPS/TPS-vs-threads
+  and latency-vs-threads uPlot charts on dual axes; per-level table; a
+  **Provenance** card with server version, max_connections, sysbench/psql/tpcc
+  SHAs and dataset; soak shows baseline + per-event disruption metrics) reading a
+  new `GET /api/runs/{id}/summary`, plus the **Classic** tab that renders the
+  existing self-contained matplotlib report inline (offline-portability kept). A
+  **Print / PDF** action (print stylesheet hides chrome; prints the classic report
+  via the iframe) and **Export CSV** downloads (`/runs/{id}/csv?which=samples|
+  timeseries|pg`). This completes the console (phases 1–7).
+
 A ground-up **operator console** (React + Vite + TypeScript SPA, served by FastAPI
 as prebuilt static assets — no Node on the droplet) is being built in reviewable
 phases alongside the existing UI. The classic server-rendered pages keep working
@@ -55,6 +66,32 @@ stays the source of truth, and RBAC/CSRF/audit/secret-handling are unchanged.
     (structured `check` events + `log`), and `POST /api/preflight|/api/prepare`,
     `GET /api/doctor`. New SPA views: a generic live Job view and a Diagnostics
     page; New-run gains Preflight / Prepare buttons.
+- **Phase 7 — installer visibility & one-command install:** `deploy.sh` now prints
+  the **operator-console URL (`/ui`)**, the **installed git SHA**, and whether the
+  prebuilt **console bundle is present** — on both fresh-install and `--update`
+  summaries — so "did my code actually land, and where's the new UI?" is
+  unambiguous. The console's built assets ship in the package (no Node on the
+  droplet); the sysbench pgsql-driver check already hard-fails the install. README
+  documents that the console lives at `/ui` (classic UI stays at `/`).
+- **Phase 5 — live PostgreSQL metrics:** a lightweight **engine-side sampler**
+  runs during run/soak and records `parsed/pg_timeseries.csv` — cache-hit %
+  (computed *over the interval*, so it shows cache re-warm after a storage
+  reattach), active connections, WAL MB/s, and server transactions/s. It lives in
+  the harness (the CLI benefits too) and runs in the worker's child, which already
+  has the password injected — the web tier never gets DB credentials. Reuses the
+  existing psql helpers, never raises, and writes only numbers (the password-leak
+  gate covers the new file). Streamed to the cockpit as a `pg` SSE event and shown
+  in a "PostgreSQL (engine-side)" chart section, clearly labelled an IOPS-proxy
+  (server counters, not device metrics). Configurable via `capture.live_pg` /
+  `capture.live_pg_interval_s` (default on, every 5s).
+
+### Fix
+- **SQLite "created in a thread" 500s on the live server.** FastAPI runs sync
+  dependencies in a threadpool, so a per-request connection could be opened and
+  closed on different worker threads; `connect()` now uses
+  `check_same_thread=False` (each connection is still used sequentially within one
+  request). This 500-ed `/api/runs`, `/api/jobs` and start-run on the real uvicorn
+  server (the TestClient masked it). Regression test added.
 
 ## 0.8.0
 

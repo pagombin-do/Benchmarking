@@ -500,6 +500,36 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return Response(out.read_text(encoding="utf-8"), media_type="text/html",
                         headers={"Content-Disposition": f'attachment; filename="{run_id}-{out.name}"'})
 
+    @app.get("/api/runs/{run_id}/summary")
+    def api_run_summary(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        """Parsed run data for the interactive in-app report (manifest + summary)."""
+        run_dir = cfg.results_dir / run_id
+        man = run_dir / "manifest.json"
+        if not man.exists():
+            raise HTTPException(404, "run not found")
+        manifest = json.loads(man.read_text(encoding="utf-8"))
+        mode = manifest.get("mode", "sweep")
+        sp = run_dir / "parsed" / ("soak_summary.json" if mode == "soak" else "summary.json")
+        summary = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else {}
+        return JSONResponse({"mode": mode, "manifest": manifest, "summary": summary,
+                             "pg": (run_dir / "parsed" / "pg_timeseries.csv").exists()})
+
+    _CSV_FILES = {"samples": "parsed/samples.csv",
+                  "timeseries": "parsed/soak_timeseries.csv",
+                  "pg": "parsed/pg_timeseries.csv"}
+
+    @app.get("/runs/{run_id}/csv")
+    def run_csv(run_id: str, which: str = "samples",
+                user: sqlite3.Row = Depends(require("viewer"))) -> Response:
+        rel = _CSV_FILES.get(which)
+        if rel is None:
+            raise HTTPException(400, f"unknown csv '{which}'")
+        p = cfg.results_dir / run_id / rel
+        if not p.exists():
+            raise HTTPException(404, "no such data for this run")
+        return Response(p.read_text(encoding="utf-8"), media_type="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{run_id}-{which}.csv"'})
+
     @app.get("/runs/{run_id}/spec")
     def run_spec(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
         p = cfg.results_dir / run_id / "spec.yaml"
@@ -741,6 +771,7 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
     log = run_dir / "harness.log"
     sent_log = 0
     sent_rows = 0
+    pg_sent = 0
     cur_file: Optional[str] = None
     budget_s = _planned_budget_s(run_dir)
     yield _event("hello", {"run_id": run_dir.name, "mode": _run_mode(run_dir),
@@ -759,6 +790,10 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
                 yield _event("samples", {"file": rel, "header": header,
                                          "offset": sent_rows, "rows": data[sent_rows:]})
                 sent_rows = len(data)
+        pg_header, pg_data = _read_csv(run_dir / "parsed" / "pg_timeseries.csv")
+        if pg_header and len(pg_data) > pg_sent:
+            yield _event("pg", {"header": pg_header, "offset": pg_sent, "rows": pg_data[pg_sent:]})
+            pg_sent = len(pg_data)
         yield _event("progress", _progress(run_dir, budget_s))
         status = _run_status(run_dir)
         if status in ("complete", "partial", "failed", "canceled"):
@@ -879,6 +914,15 @@ def _progress(run_dir: Path, budget_s: int) -> dict:
     current = next((f"{lv.get('threads')}t" for lv in levels if lv.get("status") == "running"), "")
     return {"status": status, "elapsed_s": elapsed, "budget_s": budget_s,
             "levels_total": len(levels), "levels_done": done, "current": current}
+
+
+def _read_csv(path: Path) -> tuple[str, list[str]]:
+    """Return (header, data_rows) for a CSV file, or ('', []) if absent/empty."""
+    if path.exists():
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) > 1:
+            return lines[0], lines[1:]
+    return "", []
 
 
 def _read_samples(run_dir: Path) -> tuple[Optional[str], str, list[str]]:

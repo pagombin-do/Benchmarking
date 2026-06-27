@@ -542,3 +542,56 @@ def test_prepare_enqueues_and_doctor_rbac(web):
     d = client.get("/api/doctor", auth=("op", "oppw"))
     assert d.status_code == 200 and "pgbench-harness" in d.json()["text"]
     assert client.get("/api/doctor", auth=("viewer", "vpw")).status_code == 403
+
+
+# ── regression: SQLite connection usable across threads (FastAPI threadpool) ──
+
+def test_connection_survives_cross_thread_use(tmp_path):
+    """A connection created on one thread must be usable/closable on another —
+    FastAPI runs sync deps in a threadpool and setup/teardown can differ."""
+    import threading
+    from pgbench_webapp.db import connect, migrate
+    db = tmp_path / "x.db"
+    migrate(db)
+    conn = connect(db)                      # created on the main thread
+    errors = []
+
+    def use_and_close():
+        try:
+            list(conn.execute("SELECT 1"))  # used on a different thread
+            conn.close()                    # closed on a different thread
+        except Exception as exc:            # noqa: BLE001
+            errors.append(exc)
+
+    t = threading.Thread(target=use_and_close)
+    t.start()
+    t.join()
+    assert not errors, f"cross-thread use raised: {errors}"
+
+
+def test_sse_streams_pg_metrics(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _run_worker_once(cfg)
+    run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
+    pg = cfg.results_dir / run_id / "parsed" / "pg_timeseries.csv"
+    pg.parent.mkdir(parents=True, exist_ok=True)
+    pg.write_text("t,active,total_conn,xacts_s,cache_hit_pct,wal_mb_s\n1,8,20,100.0,98.9,0.5\n")
+    body = client.get(f"/runs/{run_id}/stream", auth=("viewer", "vpw")).text
+    assert "event: pg" in body and "cache_hit_pct" in body
+
+
+def test_interactive_report_summary_and_csv(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _run_worker_once(cfg)
+    run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
+    body = client.get(f"/api/runs/{run_id}/summary", auth=("viewer", "vpw"))
+    assert body.status_code == 200
+    j = body.json()
+    assert j["mode"] in ("sweep", "soak") and "manifest" in j and "summary" in j
+    # CSV export (samples present for a sweep run); bad name -> 400; missing run -> 404
+    csv = client.get(f"/runs/{run_id}/csv?which=samples", auth=("viewer", "vpw"))
+    assert csv.status_code == 200 and "t_offset" in csv.text
+    assert client.get(f"/runs/{run_id}/csv?which=bogus", auth=("viewer", "vpw")).status_code == 400
+    assert client.get("/api/runs/nope/summary", auth=("viewer", "vpw")).status_code == 404
