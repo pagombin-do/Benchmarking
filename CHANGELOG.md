@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased — operator console (incremental)
+
+A ground-up **operator console** (React + Vite + TypeScript SPA, served by FastAPI
+as prebuilt static assets — no Node on the droplet) is being built in reviewable
+phases alongside the existing UI. The classic server-rendered pages keep working
+throughout; the SPA lives under `/ui` until it reaches parity, then becomes the
+default. The web tier still only enqueues, the worker still executes, `results/`
+stays the source of truth, and RBAC/CSRF/audit/secret-handling are unchanged.
+
+- **Phase 1 — scaffold:** Vite/TS build emitting into the package; control-room
+  design system (dark-first, IBM Plex Sans/Mono, status-as-structure colour);
+  app shell with auth bootstrap; the Runs (history) view ported. New JSON APIs
+  `GET /api/me`, `GET /api/runs`, `GET /api/jobs` (the jobs API never exposes
+  `spec_yaml`). Served at `/ui/*`.
+- **Phase 2 — live cockpit:** a real-time run view fed by SSE — multi-series
+  uPlot charts (TPS/QPS on dual axes, p99 latency, errors/s + reconnects/s),
+  live progress (elapsed vs planned budget, level completion), and a first-class
+  console pane (filter, follow, severity highlighting). The stream is now
+  **incremental** (`hello`/`log`/`samples`-with-row-offset/`progress`/`done`) —
+  no more re-sending the last 300 samples every second, and reconnect catches up
+  cleanly. New `GET /api/runs/{id}`; `max_concurrency` is now settable via
+  `GET/POST /api/settings[/concurrency]` (admin) so several clusters can run at
+  once. Per-run actions (report/spec/artifacts/mark/resume/cancel) are a coherent
+  surface on the detail page.
+- **Phase 3 — targets, re-run, inline reports:**
+  - **Inline reports:** a run's self-contained report renders *directly in the
+    console* (same-origin iframe) for past or in-flight runs — view it without
+    downloading; download / open-raw / regenerate remain.
+  - **Saved targets:** a Targets page backed by the existing `targets` table —
+    save a cluster's connection + password once (password encrypted via the
+    secret store, never in spec/DB/logs/reports/artifacts). New run lets you
+    **pick a saved target or enter a host inline** (fixes the missing-hostname
+    hole); the form ↔ YAML stay in sync with a raw power-user editor.
+  - **Re-run & clone:** one-click re-run reuses the saved target's password (no
+    re-entry); clone opens New run pre-filled from a prior spec. Runs launched
+    against a target resolve the password in the **worker** from the target, not
+    a per-job secret.
+  - Every run/job now shows its **target host**; history gains a per-row action
+    menu (report / spec / clone / re-run). New APIs: `GET/POST/DELETE
+    /api/targets`, `POST /api/runs/{id}/rerun`; runs index gains `target_host`.
+
 ## 0.8.0
 
 ### Web app: more of the deferred Part-C capabilities

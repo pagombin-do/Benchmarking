@@ -152,6 +152,12 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     def healthz() -> JSONResponse:
         return JSONResponse({"status": "ok", "version": __version__})
 
+    # ── identity (SPA bootstrap) ──
+    @app.get("/api/me")
+    def api_me(user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        return JSONResponse({"user": user["username"], "role": user["role"],
+                             "version": __version__})
+
     # ── auth ──
     @app.get("/login", response_class=HTMLResponse)
     def login_form(request: Request) -> HTMLResponse:
@@ -233,6 +239,63 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return page(request, "detail.html", user, run=run,
                     can_run=ROLE_RANK.get(user["role"], 0) >= ROLE_RANK["operator"])
 
+    # ── JSON API: runs / jobs index (SPA data) ──
+    @app.get("/api/runs")
+    def api_list_runs(conn: sqlite3.Connection = Depends(get_conn),
+                      user: sqlite3.Row = Depends(require("viewer")),
+                      q: str = "", status: str = "") -> JSONResponse:
+        where, params = [], []
+        if q:
+            where.append("(label LIKE ? OR tags LIKE ? OR ticket LIKE ? OR owner LIKE ?)")
+            params += [f"%{q}%"] * 4
+        if status:
+            where.append("status=?")
+            params.append(status)
+        rows = queries.list_runs(conn, " AND ".join(where), tuple(params))
+        return JSONResponse([dict(r) for r in rows])
+
+    @app.get("/api/runs/{run_id}")
+    def api_get_run(run_id: str, conn: sqlite3.Connection = Depends(get_conn),
+                    user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        r = queries.get_run(conn, run_id)
+        if r is None:
+            raise HTTPException(404, "run not found")
+        return JSONResponse(dict(r))
+
+    # Concurrency: how many runs the worker executes at once (the max_concurrency
+    # guard). Default 1; raise it to run against several clusters simultaneously.
+    @app.get("/api/settings")
+    def api_settings(conn: sqlite3.Connection = Depends(get_conn),
+                     user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        return JSONResponse({"max_concurrency":
+                             int(queries.get_setting(conn, "max_concurrency", "1") or 1)})
+
+    @app.post("/api/settings/concurrency")
+    def api_set_concurrency(request: Request, payload: dict,
+                            conn: sqlite3.Connection = Depends(get_conn),
+                            user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        try:
+            value = max(1, min(16, int(payload.get("value", 1))))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "value must be an integer 1–16")
+        queries.set_setting(conn, "max_concurrency", str(value))
+        queries.audit(conn, user["username"], "settings_update", target="max_concurrency",
+                      detail=str(value))
+        return JSONResponse({"max_concurrency": value})
+
+    _JOB_FIELDS = ("id", "kind", "state", "run_id", "requested_by",
+                   "scheduled_utc", "created_utc", "started_utc", "finished_utc", "error")
+
+    @app.get("/api/jobs")
+    def api_list_jobs(conn: sqlite3.Connection = Depends(get_conn),
+                      user: sqlite3.Row = Depends(require("viewer")),
+                      active: int = 0) -> JSONResponse:
+        states = ("queued", "running", "canceling") if active else ()
+        rows = queries.list_jobs(conn, states=states)
+        # Never expose spec_yaml here (large, and the source for password_env names).
+        return JSONResponse([{k: r[k] for k in _JOB_FIELDS} for r in rows])
+
     # ── JSON API: validate / dry-run ──
     @app.post("/api/validate")
     def api_validate(payload: dict,
@@ -252,17 +315,28 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                       conn: sqlite3.Connection = Depends(get_conn),
                       user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
-        spec_yaml = payload.get("spec_yaml", "")
-        v = harness_api.validate_yaml(spec_yaml)
+        doc = yaml.safe_load(payload.get("spec_yaml", "")) or {}
+        if not isinstance(doc, dict):
+            raise HTTPException(400, "spec must be a YAML mapping")
+        doc.setdefault("target", {})
+        # A saved target is authoritative for the connection (and supplies the
+        # persistent password); the spec editor's target fields are overridden.
+        target_id = payload.get("target_id")
+        if target_id:
+            tgt = queries.get_target(conn, int(target_id))
+            if tgt is None:
+                raise HTTPException(400, "unknown target")
+            doc["target"].update(host=tgt["host"], port=tgt["port"], database=tgt["dbname"],
+                                 user=tgt["dbuser"], sslmode=tgt["sslmode"])
+        # Normalize password_env to the worker's injected var; never store the password in the spec.
+        doc["target"]["password_env"] = "PGB_TARGET_PASSWORD"
+        clean_yaml = yaml.safe_dump(doc, sort_keys=False)
+        v = harness_api.validate_yaml(clean_yaml)
         if not v.get("ok"):
             raise HTTPException(400, v.get("error", "invalid spec"))
         kind = "soak" if v["mode"] == "soak" else "run"
-        # Normalize password_env to the worker's injected var; never store the password in the spec.
-        doc = yaml.safe_load(spec_yaml)
-        doc.setdefault("target", {})["password_env"] = "PGB_TARGET_PASSWORD"
-        clean_yaml = yaml.safe_dump(doc, sort_keys=False)
-        job_id = queries.enqueue_job(conn, kind, clean_yaml, None, user["username"],
-                                     scheduled_utc=payload.get("scheduled_utc") or None)
+        job_id = queries.enqueue_job(conn, kind, clean_yaml, int(target_id) if target_id else None,
+                                     user["username"], scheduled_utc=payload.get("scheduled_utc") or None)
         password = payload.get("password")
         if password:
             store.set(job_password_ref(job_id), password)  # encrypted, off-DB
@@ -305,6 +379,75 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                                      user["username"], resume_run_id=run_id)
         queries.audit(conn, user["username"], "run_resume", target=run_id, detail=f"job={job_id}")
         return JSONResponse({"job_id": job_id})
+
+    @app.post("/api/runs/{run_id}/rerun")
+    def api_rerun(run_id: str, request: Request,
+                  conn: sqlite3.Connection = Depends(get_conn),
+                  store: SecretStore = Depends(get_store),
+                  user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        _check_csrf(request, request.headers.get("x-csrf-token"))
+        run_dir = cfg.results_dir / run_id
+        spec_path = run_dir / "spec.yaml"
+        if not spec_path.exists():
+            raise HTTPException(404, "run/spec not found")
+        kind = "soak" if _run_mode(run_dir) == "soak" else "run"
+        # Reuse the original run's saved target so the password needn't be re-entered.
+        prev = queries.job_for_run(conn, run_id)
+        target_id = prev["target_id"] if prev else None
+        has_pw = False
+        if target_id:
+            tgt = queries.get_target(conn, target_id)
+            has_pw = bool(tgt and store.get(tgt["password_ref"]))
+        job_id = queries.enqueue_job(conn, kind, spec_path.read_text(encoding="utf-8"),
+                                     target_id, user["username"])
+        queries.audit(conn, user["username"], "run_rerun", target=run_id, detail=f"job={job_id}")
+        return JSONResponse({"job_id": job_id, "kind": kind, "needs_password": not has_pw})
+
+    # ── targets (saved clusters: connection + persistent encrypted password) ──
+    @app.get("/api/targets")
+    def api_targets(conn: sqlite3.Connection = Depends(get_conn),
+                    user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        # Never returns the password — only the reference lives in the DB anyway.
+        return JSONResponse([dict(r) for r in queries.list_targets(conn)])
+
+    @app.post("/api/targets")
+    def api_create_target(request: Request, payload: dict,
+                          conn: sqlite3.Connection = Depends(get_conn),
+                          store: SecretStore = Depends(get_store),
+                          user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        name = str(payload.get("name", "")).strip()
+        host = str(payload.get("host", "")).strip()
+        if not name or not host:
+            raise HTTPException(400, "name and host are required")
+        ref = f"target:{name}:password"
+        password = payload.get("password") or ""
+        if password:
+            store.set(ref, password)  # encrypted, off-DB; only the ref is stored
+        try:
+            tid = queries.create_target(
+                conn, name, host, int(payload.get("port") or 5432),
+                str(payload.get("dbname", "")).strip() or "defaultdb",
+                str(payload.get("dbuser", "")).strip() or "doadmin",
+                str(payload.get("sslmode", "require")).strip() or "require", ref)
+        except sqlite3.IntegrityError:
+            raise HTTPException(400, "a target with that name already exists")
+        queries.audit(conn, user["username"], "target_create", target=name, detail=host)
+        return JSONResponse({"id": tid, "name": name})
+
+    @app.delete("/api/targets/{target_id}")
+    def api_delete_target(target_id: int, request: Request,
+                          conn: sqlite3.Connection = Depends(get_conn),
+                          store: SecretStore = Depends(get_store),
+                          user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        _check_csrf(request, request.headers.get("x-csrf-token"))
+        tgt = queries.get_target(conn, target_id)
+        if tgt is None:
+            raise HTTPException(404, "target not found")
+        queries.delete_target(conn, target_id)
+        store.delete(tgt["password_ref"])
+        queries.audit(conn, user["username"], "target_delete", target=tgt["name"])
+        return JSONResponse({"deleted": True})
 
     # ── reports / artifacts ──
     @app.get("/runs/{run_id}/report", response_class=HTMLResponse)
@@ -531,24 +674,62 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         cached.write_text(json.dumps(data))
         return JSONResponse(data)
 
+    # ── SPA shell (served under /ui/*; assets via the /static mount) ──
+    # The shell loads unauthenticated and bootstraps via /api/me, which 401s to
+    # /login when there's no session — standard SPA auth, no secrets in the shell.
+    _spa_index = _PKG / "static" / "spa" / "index.html"
+
+    def _serve_spa() -> HTMLResponse:
+        if _spa_index.exists():
+            return HTMLResponse(_spa_index.read_text(encoding="utf-8"))
+        return HTMLResponse(
+            "<!doctype html><meta charset=utf-8><title>pgbench console</title>"
+            "<body style='font-family:system-ui;max-width:40rem;margin:4rem auto'>"
+            "<h1>Console not built</h1><p>The SPA bundle is missing. Build it with "
+            "<code>npm --prefix frontend ci &amp;&amp; npm --prefix frontend run build</code> "
+            "or install a release that ships the built assets. The classic UI remains at "
+            "<a href='/'>/</a>.</p>", status_code=200)
+
+    @app.get("/ui", response_class=HTMLResponse)
+    def spa_root() -> HTMLResponse:
+        return _serve_spa()
+
+    @app.get("/ui/{path:path}", response_class=HTMLResponse)
+    def spa_path(path: str) -> HTMLResponse:
+        return _serve_spa()
+
 
 def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]:
-    """Server-sent events: stream harness.log tail + latest samples until terminal.
+    """Server-sent events for the live cockpit.
 
-    On (re)connect the client gets a fresh snapshot, so EventSource auto-reconnect
-    catches up with no lost state. Terminates when the run reaches a terminal status.
+    Emits ``hello`` once, then incremental ``log`` (byte offset) and ``samples``
+    (row offset — only *new* per-second rows, not a re-send each tick) plus a
+    ``progress`` heartbeat, until the run reaches a terminal status. On
+    EventSource auto-reconnect a fresh generator starts at offset 0, and the
+    ``offset`` field tells the client to reset its buffers and catch up cleanly.
     """
     log = run_dir / "harness.log"
-    sent = 0
+    sent_log = 0
+    sent_rows = 0
+    cur_file: Optional[str] = None
+    budget_s = _planned_budget_s(run_dir)
+    yield _event("hello", {"run_id": run_dir.name, "mode": _run_mode(run_dir),
+                           "status": _run_status(run_dir), "budget_s": budget_s})
     for _ in range(max_ticks):
         if log.exists():
             text = log.read_text(encoding="utf-8", errors="replace")
-            if len(text) > sent:
-                yield _event("log", text[sent:])
-                sent = len(text)
-        samples = _latest_samples(run_dir)
-        if samples is not None:
-            yield _event("samples", samples)
+            if len(text) > sent_log:
+                yield _event("log", text[sent_log:])
+                sent_log = len(text)
+        rel, header, data = _read_samples(run_dir)
+        if rel is not None:
+            if rel != cur_file:          # first/swapped file -> client resets
+                cur_file, sent_rows = rel, 0
+            if len(data) > sent_rows:
+                yield _event("samples", {"file": rel, "header": header,
+                                         "offset": sent_rows, "rows": data[sent_rows:]})
+                sent_rows = len(data)
+        yield _event("progress", _progress(run_dir, budget_s))
         status = _run_status(run_dir)
         if status in ("complete", "partial", "failed", "canceled"):
             yield _event("done", {"status": status})
@@ -571,19 +752,55 @@ def _epoch(iso: Optional[str]) -> int:
         return 0
 
 
-def _run_status(run_dir: Path) -> str:
+def _manifest(run_dir: Path) -> dict:
     try:
-        return json.loads((run_dir / "manifest.json").read_text()).get("status", "")
+        return dict(json.loads((run_dir / "manifest.json").read_text()))
     except (OSError, ValueError):
-        return ""
+        return {}
 
 
-def _latest_samples(run_dir: Path) -> Optional[dict]:
-    """Tail the per-second samples for the live chart (sweep or soak)."""
+def _run_status(run_dir: Path) -> str:
+    return str(_manifest(run_dir).get("status", ""))
+
+
+def _run_mode(run_dir: Path) -> str:
+    return str(_manifest(run_dir).get("mode", "sweep"))
+
+
+def _planned_budget_s(run_dir: Path) -> int:
+    """Planned wall-clock budget from the spec (for live ETA); 0 if unknown."""
+    spec = run_dir / "spec.yaml"
+    if not spec.exists():
+        return 0
+    try:
+        return int(harness_api.dry_run(spec.read_text(encoding="utf-8")).get("budget_s", 0))
+    except Exception:  # noqa: BLE001  (ETA is best-effort, never breaks the stream)
+        return 0
+
+
+def _progress(run_dir: Path, budget_s: int) -> dict:
+    """Live progress snapshot: status, elapsed, budget, and level completion."""
+    m = _manifest(run_dir)
+    status = str(m.get("status", ""))
+    created = _epoch(m.get("created_utc"))
+    if status in ("complete", "partial", "failed", "canceled"):
+        elapsed = int(m.get("wall_time_s") or 0)
+    else:
+        now = int(datetime.now(timezone.utc).timestamp())
+        elapsed = max(0, now - created) if created else 0
+    levels = m.get("levels") or []
+    done = sum(1 for lv in levels if lv.get("status") in ("ok", "failed"))
+    current = next((f"{lv.get('threads')}t" for lv in levels if lv.get("status") == "running"), "")
+    return {"status": status, "elapsed_s": elapsed, "budget_s": budget_s,
+            "levels_total": len(levels), "levels_done": done, "current": current}
+
+
+def _read_samples(run_dir: Path) -> tuple[Optional[str], str, list[str]]:
+    """Return (relpath, header, data_rows) for the active samples file, or (None,'',[])."""
     for rel in ("parsed/soak_timeseries.csv", "parsed/samples.csv"):
         p = run_dir / rel
         if p.exists():
             lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
             if len(lines) > 1:
-                return {"file": rel, "header": lines[0], "rows": lines[-300:]}
-    return None
+                return rel, lines[0], lines[1:]
+    return None, "", []
