@@ -378,3 +378,142 @@ def test_reconcile_indexes_filesystem(web, tmp_path):
     index.reconcile(conn, cfg.results_dir)
     assert queries.get_run(conn, "cli-made-20260101T000000Z") is not None
     conn.close()
+
+
+# ── SPA console (Phase 1: JSON bootstrap APIs + shell serving) ──────────
+
+def test_api_me_reports_role_and_version(web):
+    client, _ = web
+    for user, pw, role in [("viewer", "vpw", "viewer"), ("op", "oppw", "operator"),
+                           ("admin", "apw", "admin")]:
+        r = client.get("/api/me", auth=(user, pw))
+        assert r.status_code == 200
+        body = r.json()
+        assert body["user"] == user and body["role"] == role
+        assert body["version"]
+    # unauthenticated -> 401 (drives the SPA's redirect to /login)
+    assert client.get("/api/me").status_code == 401
+
+
+def test_api_runs_and_jobs_json(web):
+    client, cfg = web
+    # start a run so there's something to index
+    r = client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    _run_worker_once(cfg)
+    runs = client.get("/api/runs", auth=("viewer", "vpw"))
+    assert runs.status_code == 200
+    assert isinstance(runs.json(), list) and len(runs.json()) >= 1
+    assert "run_id" in runs.json()[0]
+    # jobs json never exposes spec_yaml (which carries password_env references)
+    jobs = client.get("/api/jobs", auth=("viewer", "vpw"))
+    assert jobs.status_code == 200
+    for j in jobs.json():
+        assert "spec_yaml" not in j and "id" in j and "state" in j
+    # active filter returns only in-flight states (none after worker drained)
+    active = client.get("/api/jobs?active=1", auth=("viewer", "vpw")).json()
+    assert all(j["state"] in ("queued", "running", "canceling") for j in active)
+    # unauthenticated -> 401
+    assert client.get("/api/runs").status_code == 401
+
+
+def test_spa_shell_served_under_ui(web):
+    client, _ = web
+    # The shell loads unauthenticated and bootstraps via /api/me.
+    root = client.get("/ui")
+    assert root.status_code == 200
+    assert "/static/spa/assets" in root.text  # references the built bundle
+    # client-side routes return the same shell (history fallback)
+    assert client.get("/ui/runs/whatever").status_code == 200
+    # the built asset bundle is actually served by the static mount
+    import re
+    m = re.search(r"/static/spa/assets/[\w.-]+\.js", root.text)
+    assert m, "no JS asset reference in shell"
+    assert client.get(m.group(0)).status_code == 200
+
+
+# ── cockpit (Phase 2: single-run API, concurrency, incremental SSE) ─────
+
+def test_api_get_single_run(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _run_worker_once(cfg)
+    run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
+    r = client.get(f"/api/runs/{run_id}", auth=("viewer", "vpw"))
+    assert r.status_code == 200 and r.json()["run_id"] == run_id
+    assert client.get("/api/runs/does-not-exist", auth=("viewer", "vpw")).status_code == 404
+
+
+def test_concurrency_setting_rbac_and_clamp(web):
+    client, _ = web
+    assert client.get("/api/settings", auth=("viewer", "vpw")).json()["max_concurrency"] == 1
+    # operator cannot change it; admin can; value clamps to 1..16
+    assert client.post("/api/settings/concurrency", json={"value": 4}, auth=("op", "oppw")).status_code == 403
+    r = client.post("/api/settings/concurrency", json={"value": 99}, auth=("admin", "apw"))
+    assert r.status_code == 200 and r.json()["max_concurrency"] == 16
+    assert client.get("/api/settings", auth=("admin", "apw")).json()["max_concurrency"] == 16
+
+
+def test_sse_emits_hello_progress_and_incremental_samples(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _run_worker_once(cfg)
+    run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
+    body = client.get(f"/runs/{run_id}/stream", auth=("viewer", "vpw")).text
+    assert "event: hello" in body
+    assert "event: progress" in body
+    assert "event: done" in body
+    # samples are sent incrementally with a row offset (not a 300-row re-send)
+    assert "event: samples" in body and '"offset"' in body
+
+
+# ── targets & re-run (Phase 3) ──────────────────────────────────────────
+
+def _make_target(client, name="nyc3", host="db-nyc3.example.invalid"):
+    return client.post("/api/targets", json={
+        "name": name, "host": host, "dbname": "sbtest", "dbuser": "doadmin",
+        "sslmode": "require", "password": WEB_PW}, auth=("op", "oppw"))
+
+
+def test_targets_crud_rbac_and_no_password_exposed(web):
+    client, cfg = web
+    assert client.post("/api/targets", json={"name": "x", "host": "h"}, auth=("viewer", "vpw")).status_code == 403
+    r = _make_target(client)
+    assert r.status_code == 200
+    tid = r.json()["id"]
+    lst = client.get("/api/targets", auth=("viewer", "vpw")).json()
+    assert any(t["name"] == "nyc3" and t["host"] == "db-nyc3.example.invalid" for t in lst)
+    for t in lst:
+        assert "password" not in t and "password_ref" not in t   # never exposed
+    assert _make_target(client).status_code == 400                # duplicate name
+    from pgbench_webapp.secrets_store import SecretStore
+    store = SecretStore(cfg.secret_key_path, cfg.data_dir / "secrets.enc")
+    assert store.get("target:nyc3:password") == WEB_PW
+    assert client.delete(f"/api/targets/{tid}", auth=("op", "oppw")).status_code == 200
+    assert store.get("target:nyc3:password") is None              # secret erased with the target
+    assert all(t["id"] != tid for t in client.get("/api/targets", auth=("op", "oppw")).json())
+
+
+def test_target_backed_run_reuses_password_and_surfaces_host(web):
+    client, cfg = web
+    _make_target(client)
+    tid = client.get("/api/targets", auth=("op", "oppw")).json()[0]["id"]
+    # start against the saved target with NO password in the request
+    r = client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "target_id": tid}, auth=("op", "oppw"))
+    assert r.status_code == 200
+    _run_worker_once(cfg)
+    runs = client.get("/api/runs", auth=("viewer", "vpw")).json()
+    assert runs and runs[0]["target_host"] == "db-nyc3.example.invalid"
+    run_id = runs[0]["run_id"]
+    rr = client.post(f"/api/runs/{run_id}/rerun", auth=("op", "oppw"))
+    assert rr.status_code == 200 and rr.json()["needs_password"] is False
+
+
+def test_rerun_without_target_flags_needs_password(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _run_worker_once(cfg)
+    run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
+    rr = client.post(f"/api/runs/{run_id}/rerun", auth=("op", "oppw"))
+    assert rr.status_code == 200 and rr.json()["needs_password"] is True
