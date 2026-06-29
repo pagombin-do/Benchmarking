@@ -2,6 +2,89 @@
 
 ## Unreleased — operator console (incremental)
 
+- **Prepare visibility, safety, and pg_stat_statements.**
+  - **Tasks view** — a new page listing every job (runs, soaks, and the lifecycle
+    jobs prepare/preflight/doctor) with state, who, start, **duration**, and the
+    failure reason inline. prepare/preflight/doctor no longer "disappear": each
+    links to its detail. `GET /api/jobs/{id}` returns the job + (for prepare) its
+    **load metrics** (loaded units, wall time, DB size, MB/s, threads, start/end),
+    shown as KPI cards on the task detail.
+  - **prepare no longer fails/​no-ops silently.** An already-loaded dataset is a
+    clear, actionable error (offers recreate); a missing database is a clear error
+    (offers create). New `prepare` options (CLI flags + console):
+    - **create the database if missing** (ask-first checkbox; connects via a
+      maintenance DB — defaultdb/postgres — to `CREATE DATABASE`).
+    - **recreate** — drop the whole database *or* just the benchmark tables, then
+      reload. Destructive, so it requires typing the database name to confirm
+      (enforced in the UI and server and harness). After a drop it waits for the
+      DB to come back and **retries the load once on a fresh connection** to
+      absorb the known post-drop flakiness.
+    - `run --prepare` / `soak --prepare` stay idempotent (skip when present).
+  - **pg_stat_statements**: preflight now reports it as enabled, or **tries to
+    enable it** (`CREATE EXTENSION IF NOT EXISTS`) and reports success/failure —
+    every preflight re-checks. (It powers the per-query stats already captured at
+    end of run.)
+  - **Targets**: edit a saved cluster's connection and **rotate its username /
+    password** (`POST /api/targets/{id}`); the password reuses the encrypted ref.
+  - Carried via a new per-job `options` column (migration 3).
+
+- **Console parity (Jinja fully retired) + real concurrency.**
+  - **Compare, Users, Settings, Audit are now SPA pages** — the last server-
+    rendered pages are ported. The legacy paths (`/compare`, `/admin/users`,
+    `/admin/settings`, `/audit`) redirect into the console; new JSON APIs back
+    them (`GET/POST /api/users`, `POST /api/users/{u}`, `GET /api/audit`,
+    `GET/POST /api/admin/settings`). Users page guards against an admin locking
+    themselves out. Settings consolidates notifications + DigitalOcean + run
+    concurrency with inline help.
+  - **`max_concurrency` now actually parallelizes.** The worker runs up to N jobs
+    at once, each in its own thread with its own SQLite connection (only the loop
+    claims, so no claim race; `claim_next_job` still gates on `running_count`).
+    Run-id is now parsed from the harness's own stdout (`… -> <run_dir>`), which
+    is exact per job and therefore concurrency-safe. The value is configurable on
+    the **Settings** page with a clear description of what it does and the
+    trade-offs.
+
+- **Bug-bash hardening** (multi-subsystem review). Fixes:
+  - **Security — path traversal** in `/api/diff` (`a`/`b`) and `/compare/view`
+    (`runs`): these are query params (not constrained like path params), so a
+    viewer could read any `spec.yaml`/probe dirs via `../`. Now validated to a
+    single safe segment inside `results/`.
+  - **CSRF** added to `/logout` and `/api/notify/test` (cookie-session state
+    changes that the double-submit design otherwise covers).
+  - **Worker run-id mis-detection**: a `prepare` job could pick up
+    `prepare_<slug>.json` as a bogus run_id; run-id detection is now gated to
+    run/soak and filtered to manifest-bearing dirs. A cancel that kills the child
+    by signal (rc < 0) is reported as **canceled**, not failed. `run_id` is never
+    overwritten with NULL; the per-job secret is deleted in a `finally` (no orphan
+    on error); doctor/preflight/prepare no longer send SMTP/Slack.
+  - **Reconcile robustness**: a malformed/non-object `manifest.json` no longer
+    aborts indexing of all runs at startup.
+  - **Live PG sampler**: short psql timeout (8s) so a stalled sample during a
+    failover can't block the run's end or leave an orphan psql.
+  - **Preflight checklist**: any unexpected per-check exception now yields a
+    degraded event instead of killing the stream.
+  - **SSE log streaming** is incremental (byte offset) instead of re-reading the
+    whole `harness.log` every second.
+  - **Frontend**: `toYaml` now quotes scalars with YAML-special characters
+    (labels/tickets/hosts with `:`/`#`/… no longer produce a broken spec); uPlot
+    guards degenerate all-zero axes (incl. the QPS right axis); report KPI peak
+    index is bounds-safe; New-run blocks starting with no target/host selected;
+    history clears stale errors; the 401 redirect can't loop on `/login`.
+
+- **Default-UI flip:** the console (SPA at `/ui`) is now the default — `/`, `/new`
+  and `/runs/<id>` redirect into it (deep links keep working). The fully-ported
+  pages are retired from the legacy UI; Compare and the admin pages (Users,
+  Settings, Audit) remain server-rendered until ported and are reached from the
+  console nav.
+- **Fix — web/worker couldn't find the harness under systemd.** Services get a
+  minimal PATH that excludes the venv bin, so shelling out to a bare
+  `pgbench-harness` failed (`No such file or directory`) — breaking doctor,
+  preflight/prepare and every run (a queued job went straight to failed after the
+  ~3s poll and vanished from the panel). `deploy.sh` now sets
+  `PGBENCH_HARNESS_BIN=<venv>/bin/pgbench-harness` in the env file, and
+  `config.load_config()` resolves the CLI next to the running interpreter when the
+  var is unset (defense in depth).
+
 - **Phase 6 — reports (interactive view + CSV/print, offline kept):** the report
   page is now tabbed — an **Interactive** in-app view (KPI band; QPS/TPS-vs-threads
   and latency-vs-threads uPlot charts on dual axes; per-level table; a

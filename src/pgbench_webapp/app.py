@@ -188,7 +188,9 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return resp
 
     @app.post("/logout")
-    def logout(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> Response:
+    def logout(request: Request, csrf_token: str = Form(""),
+               conn: sqlite3.Connection = Depends(get_conn)) -> Response:
+        _check_csrf(request, csrf_token)
         token = request.cookies.get(SESSION_COOKIE)
         if token:
             queries.delete_session(conn, token)
@@ -197,48 +199,21 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return resp
 
     # ── pages ──
-    @app.get("/", response_class=HTMLResponse)
-    def history(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                q: str = "", status: str = "") -> Response:
-        user = current_user(request, conn)
-        if user is None:
-            return RedirectResponse("/login", status_code=303)
-        where, params = [], []
-        if q:
-            where.append("(label LIKE ? OR tags LIKE ? OR ticket LIKE ? OR owner LIKE ?)")
-            params += [f"%{q}%"] * 4
-        if status:
-            where.append("status=?")
-            params.append(status)
-        runs = queries.list_runs(conn, " AND ".join(where), tuple(params))
-        jobs = queries.list_jobs(conn, states=("queued", "running", "canceling"))
-        return page(request, "history.html", user, runs=runs, jobs=jobs, q=q, status=status)
+    # The operator console (SPA, /ui) is now the default UI. These three pages
+    # were fully ported, so the legacy paths redirect into the console; deep links
+    # keep working. (Compare and the admin pages are not yet ported, so they
+    # remain server-rendered and are reached from the console's nav.)
+    @app.get("/")
+    def root_to_console() -> Response:
+        return RedirectResponse("/ui/", status_code=307)
 
-    @app.get("/new", response_class=HTMLResponse)
-    def new_run(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> Response:
-        user = current_user(request, conn)
-        if user is None:
-            return RedirectResponse("/login", status_code=303)
-        presets = {p.stem: p.read_text() for p in sorted((_PKG / "presets").glob("*.yaml"))} \
-            if (_PKG / "presets").exists() else {}
-        for t in queries.list_templates(conn):     # saved templates appear in the dropdown
-            row = queries.get_template(conn, t["name"])
-            if row:
-                presets[f"template: {t['name']}"] = row["spec_yaml"]
-        return page(request, "new.html", user, presets=presets,
-                    can_run=ROLE_RANK.get(user["role"], 0) >= ROLE_RANK["operator"])
+    @app.get("/new")
+    def new_to_console() -> Response:
+        return RedirectResponse("/ui/new", status_code=307)
 
-    @app.get("/runs/{run_id}", response_class=HTMLResponse)
-    def run_detail(run_id: str, request: Request,
-                   conn: sqlite3.Connection = Depends(get_conn)) -> Response:
-        user = current_user(request, conn)
-        if user is None:
-            return RedirectResponse("/login", status_code=303)
-        run = queries.get_run(conn, run_id)
-        if run is None:
-            raise HTTPException(404, "run not found")
-        return page(request, "detail.html", user, run=run,
-                    can_run=ROLE_RANK.get(user["role"], 0) >= ROLE_RANK["operator"])
+    @app.get("/runs/{run_id}")
+    def detail_to_console(run_id: str) -> Response:
+        return RedirectResponse(f"/ui/runs/{run_id}", status_code=307)
 
     # ── JSON API: runs / jobs index (SPA data) ──
     @app.get("/api/runs")
@@ -285,8 +260,8 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                       detail=str(value))
         return JSONResponse({"max_concurrency": value})
 
-    _JOB_FIELDS = ("id", "kind", "state", "run_id", "requested_by",
-                   "scheduled_utc", "created_utc", "started_utc", "finished_utc", "error")
+    _JOB_FIELDS = ("id", "kind", "state", "run_id", "requested_by", "scheduled_utc",
+                   "created_utc", "started_utc", "finished_utc", "exit_code", "error")
 
     @app.get("/api/jobs")
     def api_list_jobs(conn: sqlite3.Connection = Depends(get_conn),
@@ -296,6 +271,18 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         rows = queries.list_jobs(conn, states=states)
         # Never expose spec_yaml here (large, and the source for password_env names).
         return JSONResponse([{k: r[k] for k in _JOB_FIELDS} for r in rows])
+
+    @app.get("/api/jobs/{job_id}")
+    def api_job_detail(job_id: int, conn: sqlite3.Connection = Depends(get_conn),
+                       user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        job = queries.get_job(conn, job_id)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        out = {k: job[k] for k in _JOB_FIELDS}
+        # For a prepare job, surface its data-load metrics (wall time, size, MB/s).
+        if job["kind"] == "prepare":
+            out["prepare_stats"] = harness_api.prepare_stats(job["spec_yaml"], cfg.results_dir)
+        return JSONResponse(out)
 
     # ── JSON API: validate / dry-run ──
     @app.post("/api/validate")
@@ -435,6 +422,30 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         queries.audit(conn, user["username"], "target_delete", target=tgt["name"])
         return JSONResponse({"deleted": True})
 
+    @app.post("/api/targets/{target_id}")
+    def api_update_target(target_id: int, request: Request, payload: dict,
+                          conn: sqlite3.Connection = Depends(get_conn),
+                          store: SecretStore = Depends(get_store),
+                          user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        """Update a saved target's connection and/or rotate its password."""
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        tgt = queries.get_target(conn, target_id)
+        if tgt is None:
+            raise HTTPException(404, "target not found")
+        fields = {k: payload[k] for k in ("host", "port", "dbname", "dbuser", "sslmode")
+                  if k in payload and payload[k] not in (None, "")}
+        if "port" in fields:
+            try:
+                fields["port"] = int(fields["port"])
+            except (TypeError, ValueError):
+                raise HTTPException(400, "port must be an integer")
+        queries.update_target(conn, target_id, **fields)
+        if payload.get("password"):                 # rotate credential, reusing the ref
+            store.set(tgt["password_ref"], payload["password"])
+        queries.audit(conn, user["username"], "target_update", target=tgt["name"],
+                      detail=",".join(list(fields) + (["password"] if payload.get("password") else [])))
+        return JSONResponse({"ok": True})
+
     # ── lifecycle tasks: preflight / prepare / doctor (live via the job queue) ──
     @app.post("/api/preflight")
     def api_preflight(request: Request, payload: dict,
@@ -457,12 +468,25 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         v = harness_api.validate_yaml(clean_yaml)
         if not v.get("ok"):
             raise HTTPException(400, v.get("error", "invalid spec"))
-        job_id = queries.enqueue_job(conn, kind, clean_yaml, target_id, user["username"])
+        options = None
+        if kind == "prepare":
+            doc = yaml.safe_load(clean_yaml) or {}
+            db = (doc.get("target") or {}).get("database", "")
+            recreate = payload.get("recreate") or ""
+            if recreate not in ("", "database", "tables"):
+                raise HTTPException(400, "recreate must be 'database' or 'tables'")
+            if recreate and str(payload.get("confirm", "")) != db:
+                raise HTTPException(400, "type the exact database name to confirm a destructive recreate")
+            opt = {"create_db": bool(payload.get("create_db")),
+                   "recreate": recreate, "confirm": payload.get("confirm", "")}
+            options = json.dumps(opt)
+        job_id = queries.enqueue_job(conn, kind, clean_yaml, target_id, user["username"],
+                                     options=options)
         password = payload.get("password")
         if password:
             store.set(job_password_ref(job_id), password)
         queries.audit(conn, user["username"], f"{kind}_enqueue", target=v["label"],
-                      detail=f"job={job_id}")
+                      detail=f"job={job_id}" + (f" {payload.get('recreate')}" if payload.get("recreate") else ""))
         return JSONResponse({"job_id": job_id, "kind": kind})
 
     @app.get("/api/doctor")
@@ -504,13 +528,17 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     def api_run_summary(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
         """Parsed run data for the interactive in-app report (manifest + summary)."""
         run_dir = cfg.results_dir / run_id
-        man = run_dir / "manifest.json"
-        if not man.exists():
+        if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
-        manifest = json.loads(man.read_text(encoding="utf-8"))
+        manifest = _manifest(run_dir)          # tolerant of a malformed manifest
         mode = manifest.get("mode", "sweep")
         sp = run_dir / "parsed" / ("soak_summary.json" if mode == "soak" else "summary.json")
-        summary = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else {}
+        summary: dict = {}
+        if sp.exists():
+            try:
+                summary = json.loads(sp.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                summary = {}
         return JSONResponse({"mode": mode, "manifest": manifest, "summary": summary,
                              "pg": (run_dir / "parsed" / "pg_timeseries.csv").exists()})
 
@@ -556,16 +584,13 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return StreamingResponse(_sse(cfg, run_dir), media_type="text/event-stream")
 
     # ── compare ──
-    @app.get("/compare", response_class=HTMLResponse)
-    def compare_page(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> Response:
-        user = current_user(request, conn)
-        if user is None:
-            return RedirectResponse("/login", status_code=303)
-        return page(request, "compare.html", user, runs=queries.list_runs(conn))
+    @app.get("/compare")
+    def compare_to_console() -> Response:
+        return RedirectResponse("/ui/compare", status_code=307)
 
     @app.get("/compare/view", response_class=HTMLResponse)
     def compare_view(runs: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
-        ids = [r for r in runs.split(",") if r]
+        ids = [_safe_segment(r) for r in runs.split(",") if r]
         dirs = [cfg.results_dir / r for r in ids]
         for d in dirs:
             if not (d / "manifest.json").exists():
@@ -575,11 +600,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         path = harness_api.compare(dirs, out / f"compare-{'-'.join(ids)[:80]}.html")
         return HTMLResponse(path.read_text(encoding="utf-8"))
 
-    # ── admin: users / audit ──
-    @app.get("/admin/users", response_class=HTMLResponse)
-    def users_page(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                   user: sqlite3.Row = Depends(require("admin"))) -> Response:
-        return page(request, "admin_users.html", user, users=queries.list_users(conn))
+    # ── admin: users / audit (legacy paths redirect into the console) ──
+    @app.get("/admin/users")
+    def users_to_console() -> Response:
+        return RedirectResponse("/ui/users", status_code=307)
 
     @app.post("/admin/users")
     def users_create(request: Request, username: str = Form(...), password: str = Form(...),
@@ -596,10 +620,9 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         queries.audit(conn, user["username"], "user_create", target=username, detail=role)
         return RedirectResponse("/admin/users", status_code=303)
 
-    @app.get("/audit", response_class=HTMLResponse)
-    def audit_page(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                   user: sqlite3.Row = Depends(require("admin"))) -> Response:
-        return page(request, "audit.html", user, rows=queries.list_audit(conn))
+    @app.get("/audit")
+    def audit_to_console() -> Response:
+        return RedirectResponse("/ui/audit", status_code=307)
 
     @app.get("/audit/export.csv")
     def audit_export(conn: sqlite3.Connection = Depends(get_conn),
@@ -613,49 +636,113 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return Response(buf.getvalue(), media_type="text/csv",
                         headers={"Content-Disposition": 'attachment; filename="audit.csv"'})
 
-    # ── admin settings: notifications + provider metrics (secrets server-side) ──
-    @app.get("/admin/settings", response_class=HTMLResponse)
-    def settings_page(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                      user: sqlite3.Row = Depends(require("admin"))) -> Response:
-        nc = notify.get_config(conn)
-        return page(request, "admin_settings.html", user,
-                    notify_cfg=nc, base_url=queries.get_setting(conn, "base_url", ""),
-                    do_cluster=queries.get_setting(conn, "do_cluster_id", ""),
-                    has_smtp_pw=bool(store.get(notify.SMTP_PASSWORD_REF)),
-                    has_slack=bool(store.get(notify.SLACK_WEBHOOK_REF)),
-                    has_do_token=bool(store.get(provider.DO_TOKEN_REF)))
+    @app.get("/admin/settings")
+    def settings_to_console() -> Response:
+        return RedirectResponse("/ui/settings", status_code=307)
 
-    @app.post("/admin/settings")
-    def settings_save(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                      user: sqlite3.Row = Depends(require("admin")),
-                      csrf_token: str = Form(""), base_url: str = Form(""),
-                      smtp_host: str = Form(""), smtp_port: str = Form("587"),
-                      smtp_user: str = Form(""), smtp_from: str = Form(""),
-                      smtp_to: str = Form(""), smtp_tls: str = Form("on"),
-                      smtp_password: str = Form(""), slack_enabled: str = Form(""),
-                      slack_webhook: str = Form(""), do_cluster_id: str = Form(""),
-                      do_api_token: str = Form("")) -> Response:
-        _check_csrf(request, csrf_token)
+    # ── JSON admin APIs (consumed by the SPA Users/Audit/Settings pages) ──
+    @app.get("/api/users")
+    def api_users(conn: sqlite3.Connection = Depends(get_conn),
+                  user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        return JSONResponse([dict(r) for r in queries.list_users(conn)])
+
+    @app.post("/api/users")
+    def api_create_user2(request: Request, payload: dict,
+                         conn: sqlite3.Connection = Depends(get_conn),
+                         user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        username = str(payload.get("username", "")).strip()
+        password = payload.get("password") or ""
+        role = str(payload.get("role", "viewer"))
+        if not username or not password:
+            raise HTTPException(400, "username and password are required")
+        if role not in ROLE_RANK:
+            raise HTTPException(400, "bad role")
+        try:
+            queries.create_user(conn, username, hash_password(password), role)
+        except sqlite3.IntegrityError:
+            raise HTTPException(400, "a user with that name already exists")
+        queries.audit(conn, user["username"], "user_create", target=username, detail=role)
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/users/{username}")
+    def api_update_user(username: str, request: Request, payload: dict,
+                        conn: sqlite3.Connection = Depends(get_conn),
+                        user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        if queries.get_user(conn, username) is None:
+            raise HTTPException(404, "user not found")
+        if username == user["username"] and (payload.get("disabled")
+                                             or payload.get("role") not in (None, "admin")):
+            raise HTTPException(400, "you can't disable or demote your own admin account")
+        if "role" in payload:
+            if payload["role"] not in ROLE_RANK:
+                raise HTTPException(400, "bad role")
+            queries.set_user_role(conn, username, payload["role"])
+        if "disabled" in payload:
+            queries.set_user_disabled(conn, username, bool(payload["disabled"]))
+        if payload.get("password"):
+            queries.set_user_password(conn, username, hash_password(payload["password"]))
+        queries.audit(conn, user["username"], "user_update", target=username,
+                      detail=",".join(k for k in ("role", "disabled", "password") if k in payload))
+        return JSONResponse({"ok": True})
+
+    @app.get("/api/audit")
+    def api_audit(limit: int = 500, conn: sqlite3.Connection = Depends(get_conn),
+                  user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        rows = queries.list_audit(conn, limit=min(max(limit, 1), 5000))
+        return JSONResponse([dict(r) for r in rows])
+
+    @app.get("/api/admin/settings")
+    def api_admin_settings(conn: sqlite3.Connection = Depends(get_conn),
+                           user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        return JSONResponse({
+            "notify": notify.get_config(conn),
+            "base_url": queries.get_setting(conn, "base_url", ""),
+            "do_cluster_id": queries.get_setting(conn, "do_cluster_id", ""),
+            "max_concurrency": int(queries.get_setting(conn, "max_concurrency", "1") or 1),
+            "has_smtp_pw": bool(store.get(notify.SMTP_PASSWORD_REF)),
+            "has_slack": bool(store.get(notify.SLACK_WEBHOOK_REF)),
+            "has_do_token": bool(store.get(provider.DO_TOKEN_REF))})
+
+    @app.post("/api/admin/settings")
+    def api_admin_settings_save(request: Request, payload: dict,
+                                conn: sqlite3.Connection = Depends(get_conn),
+                                user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        smtp = payload.get("smtp") or {}
+        slack = payload.get("slack") or {}
+        try:
+            port = int(smtp.get("port") or 587)
+        except (TypeError, ValueError):
+            port = 587
         notify.set_config(conn, {
-            "smtp": {"host": smtp_host, "port": int(smtp_port or 587), "user": smtp_user,
-                     "from": smtp_from, "to": smtp_to, "tls": smtp_tls == "on"},
-            "slack": {"enabled": slack_enabled == "on"}})
-        queries.set_setting(conn, "base_url", base_url)
-        queries.set_setting(conn, "do_cluster_id", do_cluster_id)
+            "smtp": {"host": str(smtp.get("host", "")), "port": port,
+                     "user": str(smtp.get("user", "")), "from": str(smtp.get("from", "")),
+                     "to": str(smtp.get("to", "")), "tls": bool(smtp.get("tls", True))},
+            "slack": {"enabled": bool(slack.get("enabled"))}})
+        queries.set_setting(conn, "base_url", str(payload.get("base_url", "")))
+        queries.set_setting(conn, "do_cluster_id", str(payload.get("do_cluster_id", "")))
+        if payload.get("max_concurrency") is not None:
+            try:
+                mc = max(1, min(16, int(payload["max_concurrency"])))
+                queries.set_setting(conn, "max_concurrency", str(mc))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "max_concurrency must be an integer 1–16")
         # Secrets only updated when a new value is supplied (blank leaves as-is).
-        if smtp_password:
-            store.set(notify.SMTP_PASSWORD_REF, smtp_password)
-        if slack_webhook:
-            store.set(notify.SLACK_WEBHOOK_REF, slack_webhook)
-        if do_api_token:
-            store.set(provider.DO_TOKEN_REF, do_api_token)
-        queries.audit(conn, user["username"], "settings_update",
-                      detail="notifications/provider config changed")
-        return RedirectResponse("/admin/settings", status_code=303)
+        if payload.get("smtp_password"):
+            store.set(notify.SMTP_PASSWORD_REF, payload["smtp_password"])
+        if payload.get("slack_webhook"):
+            store.set(notify.SLACK_WEBHOOK_REF, payload["slack_webhook"])
+        if payload.get("do_api_token"):
+            store.set(provider.DO_TOKEN_REF, payload["do_api_token"])
+        queries.audit(conn, user["username"], "settings_update", detail="via console settings")
+        return JSONResponse({"ok": True})
 
     @app.post("/api/notify/test")
-    def notify_test(conn: sqlite3.Connection = Depends(get_conn),
+    def notify_test(request: Request, conn: sqlite3.Connection = Depends(get_conn),
                     user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        _check_csrf(request, request.headers.get("x-csrf-token"))
         sent = notify.notify(conn, store, state="test", run_id=None,
                              label="notification test", peak_qps=None)
         return JSONResponse({"sent": sent})
@@ -698,7 +785,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             if row is None:
                 raise HTTPException(404, f"template not found: {ref}")
             return str(row["spec_yaml"])
-        p = cfg.results_dir / ref / "spec.yaml"
+        p = cfg.results_dir / _safe_segment(ref) / "spec.yaml"
         if not p.exists():
             raise HTTPException(404, f"spec not found: {ref}")
         return p.read_text(encoding="utf-8")
@@ -718,7 +805,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         run_dir = cfg.results_dir / run_id
         cached = run_dir / "env" / "provider_metrics.json"
         if cached.exists():
-            return JSONResponse(json.loads(cached.read_text()))
+            try:
+                return JSONResponse(json.loads(cached.read_text()))
+            except (ValueError, OSError):
+                pass   # fall through and refetch
         if not provider.configured(conn, store):
             return JSONResponse({"available": False,
                                  "reason": "no DO token/cluster configured (engine-side only)"})
@@ -778,10 +868,9 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
                            "status": _run_status(run_dir), "budget_s": budget_s})
     for _ in range(max_ticks):
         if log.exists():
-            text = log.read_text(encoding="utf-8", errors="replace")
-            if len(text) > sent_log:
-                yield _event("log", text[sent_log:])
-                sent_log = len(text)
+            chunk, sent_log = _read_tail(log, sent_log)   # byte offset; incremental
+            if chunk:
+                yield _event("log", chunk)
         rel, header, data = _read_samples(run_dir)
         if rel is not None:
             if rel != cur_file:          # first/swapped file -> client resets
@@ -804,6 +893,18 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
 
 def _event(name: str, data: Any) -> str:
     return f"event: {name}\ndata: {json.dumps(data)}\n\n"
+
+
+def _safe_segment(ref: str) -> str:
+    """Validate a run-id used to build a filesystem path (no traversal).
+
+    Used for query-param ids (path params are already constrained to one segment
+    by Starlette, but query params are not). Rejects empty, separators, leading
+    dots, and ``..`` so ``results_dir / ref`` can never escape the tree.
+    """
+    if not ref or "/" in ref or "\\" in ref or ".." in ref or ref.startswith("."):
+        raise HTTPException(400, f"invalid id: {ref!r}")
+    return ref
 
 
 def _spec_with_target(conn: sqlite3.Connection, payload: dict) -> tuple[str, Optional[int]]:
@@ -914,6 +1015,26 @@ def _progress(run_dir: Path, budget_s: int) -> dict:
     current = next((f"{lv.get('threads')}t" for lv in levels if lv.get("status") == "running"), "")
     return {"status": status, "elapsed_s": elapsed, "budget_s": budget_s,
             "levels_total": len(levels), "levels_done": done, "current": current}
+
+
+def _read_tail(path: Path, offset: int) -> tuple[str, int]:
+    """Read complete new lines past *offset* bytes (incremental log streaming).
+
+    Returns (text, new_offset). Avoids re-reading the whole (potentially huge,
+    multi-hour) log each tick; only emits up to the last newline so a partial
+    in-progress line waits for its terminator.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            data = fh.read()
+    except OSError:
+        return "", offset
+    nl = data.rfind(b"\n")
+    if nl == -1:
+        return "", offset
+    consumed = data[: nl + 1]
+    return consumed.decode("utf-8", "replace"), offset + len(consumed)
 
 
 def _read_csv(path: Path) -> tuple[str, list[str]]:
