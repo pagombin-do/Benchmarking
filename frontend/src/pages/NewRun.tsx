@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import type { Me, Target } from "../types";
@@ -8,13 +8,26 @@ function toYaml(o: Record<string, unknown>, indent = ""): string {
   const lines: string[] = [];
   for (const [k, v] of Object.entries(o)) {
     if (v === undefined || v === null || v === "") continue;
-    if (Array.isArray(v)) lines.push(`${indent}${k}: [${v.join(", ")}]`);
+    if (Array.isArray(v)) lines.push(`${indent}${k}: [${v.map(yamlScalar).join(", ")}]`);
     else if (typeof v === "object") {
       const inner = toYaml(v as Record<string, unknown>, indent + "  ");
       if (inner) { lines.push(`${indent}${k}:`); lines.push(inner); }
-    } else lines.push(`${indent}${k}: ${v}`);
+    } else lines.push(`${indent}${k}: ${yamlScalar(v)}`);
   }
   return lines.join("\n");
+}
+
+// Quote a scalar when it would otherwise be misparsed as YAML (contains `:` `#`,
+// leading/trailing space, a leading indicator char, or looks like a bool/number).
+// JSON double-quoting is valid YAML flow-scalar syntax.
+function yamlScalar(v: unknown): string {
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  const s = String(v);
+  const needsQuote =
+    s === "" || /[:#\[\]{}&*!|>'"%@`,]/.test(s) || /^[\s\-?]/.test(s) || /\s$/.test(s) ||
+    ["true", "false", "null", "yes", "no", "on", "off", "~"].includes(s.toLowerCase()) ||
+    /^[+-]?(\d|\.\d)/.test(s);   // numeric-looking strings stay strings
+  return needsQuote ? JSON.stringify(s) : s;
 }
 
 const WORKLOADS = ["tpcc", "oltp_read_write", "oltp_read_only", "oltp_write_only"];
@@ -36,13 +49,15 @@ export function NewRun({ me }: { me: Me }) {
   const [soak, setSoak] = useState({ threads: 64, duration_s: 3600, tolerate_errors: true });
   const [schedule, setSchedule] = useState("");
   const [tplName, setTplName] = useState("");
+  const [createDb, setCreateDb] = useState(false);
+  const [recreateScope, setRecreateScope] = useState("");   // "" | "database" | "tables"
+  const [confirmDb, setConfirmDb] = useState("");
 
   const [yaml, setYaml] = useState("");
   const [autoSync, setAutoSync] = useState(true);
   const [validateOut, setValidateOut] = useState<{ ok: boolean; msg: string } | null>(null);
   const [dryOut, setDryOut] = useState("");
   const [err, setErr] = useState<string | null>(null);
-  const firstBuild = useRef(true);
 
   useEffect(() => {
     api.get<Target[]>("/api/targets").then((t) => {
@@ -81,8 +96,7 @@ export function NewRun({ me }: { me: Me }) {
   }, [targetMode, targetId, targets, inline, meta, wl, mode, sweep, soak]);
 
   useEffect(() => {
-    if (autoSync) { setYaml(toYaml(doc) + "\n"); }
-    firstBuild.current = false;
+    if (autoSync) setYaml(toYaml(doc) + "\n");
   }, [doc, autoSync]);
 
   async function validate() {
@@ -102,22 +116,38 @@ export function NewRun({ me }: { me: Me }) {
       setDryOut(`# ${d.mode} — planned wall-clock ~${Math.round(d.budget_s / 60)} min (${d.budget_s}s)\n` + d.commands.join("\n"));
     } catch (e) { setDryOut("error: " + (e as Error).message); }
   }
+  function credBody(): Record<string, unknown> {
+    if (targetMode === "saved") {
+      if (!targetId) throw new Error("select a saved target first (or choose “Enter host”)");
+      return { target_id: targetId };
+    }
+    if (!inline.host.trim()) throw new Error("enter a host (or choose a saved target)");
+    return { password: inline.password };
+  }
   async function start() {
     setErr(null);
     try {
-      const body: Record<string, unknown> = { spec_yaml: yaml, scheduled_utc: schedule.trim() || null };
-      if (targetMode === "saved") body.target_id = targetId;
-      else body.password = inline.password;
-      await api.post("/api/runs", body);
+      await api.post("/api/runs", { spec_yaml: yaml, scheduled_utc: schedule.trim() || null, ...credBody() });
       window.location.href = "/ui";
     } catch (e) { setErr("could not start: " + (e as Error).message); }
   }
+  // Target database the prepare options act on (for the typed-confirm guard).
+  const targetDb = targetMode === "saved"
+    ? (targets.find((t) => t.id === targetId)?.dbname ?? "")
+    : inline.database;
+
   async function task(kind: "preflight" | "prepare") {
     setErr(null);
     try {
-      const body: Record<string, unknown> = { spec_yaml: yaml };
-      if (targetMode === "saved") body.target_id = targetId;
-      else body.password = inline.password;
+      const body: Record<string, unknown> = { spec_yaml: yaml, ...credBody() };
+      if (kind === "prepare") {
+        if (createDb) body.create_db = true;
+        if (recreateScope) {
+          if (confirmDb !== targetDb) throw new Error(`type the database name "${targetDb}" to confirm the drop`);
+          body.recreate = recreateScope;
+          body.confirm = confirmDb;
+        }
+      }
       const d = await api.post<{ job_id: number }>(`/api/${kind}`, body);
       navigate(`/jobs/${d.job_id}`);
     } catch (e) { setErr(`could not start ${kind}: ` + (e as Error).message); }
@@ -235,6 +265,29 @@ export function NewRun({ me }: { me: Me }) {
               : <span className="subtle">viewer role: read-only</span>}
           </div>
           {dryOut && <pre className="out mono dry">{dryOut}</pre>}
+
+          {canRun && (
+            <details className="prep-opts">
+              <summary className="subtle">Prepare options (create / recreate database)</summary>
+              <label className="follow"><input type="checkbox" checked={createDb} onChange={(e) => setCreateDb(e.target.checked)} /> Create the database <code>{targetDb || "—"}</code> if it doesn't exist</label>
+              <label className="follow"><input type="checkbox" checked={!!recreateScope} onChange={(e) => { setRecreateScope(e.target.checked ? "database" : ""); setConfirmDb(""); }} /> Drop existing data first (DESTRUCTIVE)</label>
+              {recreateScope && (
+                <div className="recreate-box">
+                  <label>What to drop
+                    <select value={recreateScope} onChange={(e) => setRecreateScope(e.target.value)}>
+                      <option value="database">the whole database ({targetDb})</option>
+                      <option value="tables">only the benchmark tables</option>
+                    </select>
+                  </label>
+                  <label>Type <code>{targetDb}</code> to confirm
+                    <input value={confirmDb} onChange={(e) => setConfirmDb(e.target.value)} placeholder={targetDb} autoComplete="off" /></label>
+                  <p className="subtle" style={{ fontSize: 12 }}>
+                    This permanently deletes {recreateScope === "database" ? "the entire database and everything in it" : "the sysbench/tpcc tables"} before reloading. Applies when you click <b>Prepare data</b>.
+                  </p>
+                </div>
+              )}
+            </details>
+          )}
         </div>
       </div>
     </>

@@ -137,10 +137,10 @@ def test_rbac_matrix(web):
     # viewer: can validate, cannot start/cancel/admin
     assert client.post("/api/validate", json={"spec_yaml": spec}, auth=("viewer", "vpw")).status_code == 200
     assert client.post("/api/runs", json={"spec_yaml": spec}, auth=("viewer", "vpw")).status_code == 403
-    assert client.get("/admin/users", auth=("viewer", "vpw")).status_code == 403
-    assert client.get("/audit", auth=("op", "oppw")).status_code == 403          # operator not admin
+    assert client.get("/api/users", auth=("viewer", "vpw")).status_code == 403
+    assert client.get("/api/audit", auth=("op", "oppw")).status_code == 403       # operator not admin
     # operator: can start; admin: can admin
-    assert client.get("/admin/users", auth=("admin", "apw")).status_code == 200
+    assert client.get("/api/users", auth=("admin", "apw")).status_code == 200
     # unauthenticated
     assert client.post("/api/validate", json={"spec_yaml": spec}).status_code == 401
 
@@ -169,8 +169,10 @@ def test_run_through_api_and_worker(web):
     assert jid == job_id and state == "done"
     run_id = job["run_id"]
     assert run_id and (cfg.results_dir / run_id / "manifest.json").exists()
-    # appears in history + report renders + artifact downloads
-    assert run_id in client.get("/", auth=("viewer", "vpw")).text
+    # appears in the runs index + report renders + artifact downloads
+    assert any(r["run_id"] == run_id for r in client.get("/api/runs", auth=("viewer", "vpw")).json())
+    # the console is now the default UI: legacy paths redirect into /ui
+    assert client.get("/", auth=("viewer", "vpw"), follow_redirects=False).headers["location"] == "/ui/"
     rep = client.get(f"/runs/{run_id}/report", auth=("viewer", "vpw"))
     assert rep.status_code == 200 and "Headline results" in rep.text
     art = client.get(f"/runs/{run_id}/artifact", auth=("viewer", "vpw"))
@@ -348,11 +350,11 @@ def test_provider_fetch_mocked_no_token_leak(web, monkeypatch, tmp_path):
 
 def test_settings_save_keeps_secrets_off_db(web):
     client, cfg = web
-    r = client.post("/admin/settings", data={
-        "csrf_token": "", "base_url": "https://h:8443", "do_cluster_id": "c1",
+    r = client.post("/api/admin/settings", json={
+        "base_url": "https://h:8443", "do_cluster_id": "c1",
         "do_api_token": "do-tok-SECRET", "slack_webhook": "https://hooks/secret",
-        "smtp_host": "", "smtp_port": "587"}, auth=("admin", "apw"))
-    assert r.status_code in (200, 303)
+        "smtp": {"host": "", "port": 587}, "slack": {}}, auth=("admin", "apw"))
+    assert r.status_code == 200
     from pgbench_webapp import provider, notify
     _, store = _conn_store(cfg)
     assert store.get(provider.DO_TOKEN_REF) == "do-tok-SECRET"
@@ -595,3 +597,139 @@ def test_interactive_report_summary_and_csv(web):
     assert csv.status_code == 200 and "t_offset" in csv.text
     assert client.get(f"/runs/{run_id}/csv?which=bogus", auth=("viewer", "vpw")).status_code == 400
     assert client.get("/api/runs/nope/summary", auth=("viewer", "vpw")).status_code == 404
+
+
+def test_legacy_paths_redirect_to_console(web):
+    client, _ = web
+    for path, target in [("/", "/ui/"), ("/new", "/ui/new")]:
+        r = client.get(path, auth=("op", "oppw"), follow_redirects=False)
+        assert r.status_code == 307 and r.headers["location"] == target
+    r = client.get("/runs/some-run-id", auth=("op", "oppw"), follow_redirects=False)
+    assert r.status_code == 307 and r.headers["location"] == "/ui/runs/some-run-id"
+    # not-yet-ported pages remain server-rendered
+    assert client.get("/compare", auth=("op", "oppw")).status_code == 200
+
+
+# ── bug-bash regressions ────────────────────────────────────────────────
+
+def test_diff_and_compare_reject_path_traversal(web):
+    client, _ = web
+    assert client.get("/api/diff?a=../../../../etc/hosts&b=x", auth=("viewer", "vpw")).status_code == 400
+    assert client.get("/api/diff?a=a/b&b=x", auth=("viewer", "vpw")).status_code == 400
+    assert client.get("/compare/view?runs=../../etc", auth=("viewer", "vpw")).status_code == 400
+
+
+def test_prepare_job_sets_no_run_id(web):
+    """A prepare job must not pick up prepare_<slug>.json as a bogus run_id."""
+    client, cfg = web
+    client.post("/api/prepare", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    _, state, job = _run_worker_once(cfg)
+    assert not job["run_id"]            # gated to run/soak kinds only
+
+
+def test_reconcile_skips_malformed_manifest(web, tmp_path):
+    """A non-dict manifest.json must not abort indexing of all runs."""
+    from pgbench_webapp import index, queries
+    from pgbench_webapp.db import connect
+    bad = cfg_results(web) / "bad-run"
+    bad.mkdir(parents=True)
+    (bad / "manifest.json").write_text("[1, 2, 3]")          # valid JSON, not an object
+    good = cfg_results(web) / "good-run"
+    good.mkdir(parents=True)
+    (good / "manifest.json").write_text(
+        '{"run_id":"good-run","mode":"sweep","status":"complete","created_utc":"2026-01-01T00:00:00Z"}')
+    conn = connect(web[1].db_path)
+    n = index.reconcile(conn, web[1].results_dir)            # must not raise
+    assert queries.get_run(conn, "good-run") is not None
+    assert queries.get_run(conn, "bad-run") is None
+    conn.close()
+
+
+def cfg_results(web):
+    return web[1].results_dir
+
+
+# ── Phase 8: SPA admin APIs, concurrency, run-id parsing ────────────────
+
+def test_parse_run_id_from_output():
+    from pathlib import Path
+    from pgbench_webapp.worker import _parse_run_id
+    rd = Path("/var/lib/pgbench-harness/results")
+    rid = "advanced-8c32g-tpcc-20260101-000000"
+    assert _parse_run_id(f"run {rid} -> {rd}/{rid} (budget 5m)\n", rd) == rid
+    assert _parse_run_id("nothing here", rd) is None
+
+
+def test_admin_settings_api_and_concurrency(web):
+    client, _ = web
+    assert client.get("/api/admin/settings", auth=("op", "oppw")).status_code == 403
+    s = client.get("/api/admin/settings", auth=("admin", "apw")).json()
+    assert s["max_concurrency"] == 1 and "has_smtp_pw" in s
+    r = client.post("/api/admin/settings",
+                    json={"max_concurrency": 4, "smtp": {}, "slack": {}, "base_url": ""},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200
+    assert client.get("/api/admin/settings", auth=("admin", "apw")).json()["max_concurrency"] == 4
+
+
+def test_users_api_create_update_self_protect(web):
+    client, _ = web
+    assert client.get("/api/users", auth=("viewer", "vpw")).status_code == 403
+    assert client.post("/api/users", json={"username": "bob", "password": "pw", "role": "operator"},
+                       auth=("admin", "apw")).status_code == 200
+    assert any(u["username"] == "bob" for u in client.get("/api/users", auth=("admin", "apw")).json())
+    assert client.post("/api/users/bob", json={"role": "viewer"}, auth=("admin", "apw")).status_code == 200
+    # an admin cannot lock themselves out
+    assert client.post("/api/users/admin", json={"disabled": True}, auth=("admin", "apw")).status_code == 400
+
+
+def test_legacy_admin_paths_redirect_to_console(web):
+    client, _ = web
+    for path, target in [("/admin/users", "/ui/users"), ("/admin/settings", "/ui/settings"),
+                         ("/audit", "/ui/audit"), ("/compare", "/ui/compare")]:
+        r = client.get(path, auth=("admin", "apw"), follow_redirects=False)
+        assert r.status_code == 307 and r.headers["location"] == target
+
+
+# ── Phase 9: prepare safety, target creds, job detail/prepare stats ─────
+
+def test_prepare_recreate_requires_confirm_api(web):
+    client, _ = web
+    spec = _spec_yaml()
+    # destructive recreate without a matching typed confirmation is rejected
+    r = client.post("/api/prepare", json={"spec_yaml": spec, "password": WEB_PW,
+                                          "recreate": "database"}, auth=("op", "oppw"))
+    assert r.status_code == 400
+    r = client.post("/api/prepare", json={"spec_yaml": spec, "password": WEB_PW,
+                                          "recreate": "database", "confirm": "sbtest"}, auth=("op", "oppw"))
+    assert r.status_code == 200 and r.json()["kind"] == "prepare"
+
+
+def test_target_update_rotates_credentials(web):
+    client, cfg = web
+    client.post("/api/targets", json={"name": "t1", "host": "h", "dbname": "sbtest",
+                                      "dbuser": "olduser", "password": "oldpw"}, auth=("op", "oppw"))
+    tid = client.get("/api/targets", auth=("op", "oppw")).json()[0]["id"]
+    r = client.post(f"/api/targets/{tid}", json={"dbuser": "newuser", "password": "newpw"}, auth=("op", "oppw"))
+    assert r.status_code == 200
+    t = [t for t in client.get("/api/targets", auth=("op", "oppw")).json() if t["id"] == tid][0]
+    assert t["dbuser"] == "newuser"
+    from pgbench_webapp.secrets_store import SecretStore
+    store = SecretStore(cfg.secret_key_path, cfg.data_dir / "secrets.enc")
+    assert store.get("target:t1:password") == "newpw"
+    # viewer cannot update
+    assert client.post(f"/api/targets/{tid}", json={"dbuser": "x"}, auth=("viewer", "vpw")).status_code == 403
+
+
+def test_job_detail_includes_prepare_stats(web):
+    client, cfg = web
+    jid = client.post("/api/prepare", json={"spec_yaml": _spec_yaml(), "password": WEB_PW},
+                      auth=("op", "oppw")).json()["job_id"]
+    # write the load-metrics file prepare would produce (slug = host-database)
+    cfg.results_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.results_dir / "prepare_db-example-invalid-sbtest.json").write_text(
+        '{"loaded_units":"300 warehouses","wall_s":1234.5,"db_size_pretty":"38.2 GiB",'
+        '"load_mb_s":31.2,"started_utc":"2026-06-28T10:00:00Z","finished_utc":"2026-06-28T10:20:34Z"}')
+    d = client.get(f"/api/jobs/{jid}", auth=("viewer", "vpw")).json()
+    assert d["kind"] == "prepare" and d["prepare_stats"]["loaded_units"] == "300 warehouses"
+    assert client.get("/api/jobs/99999", auth=("viewer", "vpw")).status_code == 404
