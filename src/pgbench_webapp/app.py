@@ -11,6 +11,7 @@ import base64
 import difflib
 import io
 import json
+import shutil
 import sqlite3
 import subprocess
 import tarfile
@@ -26,6 +27,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from pgbench_harness.capture import KEY_SETTINGS
 from pgbench_webapp import __version__, harness_api, index, notify, provider, queries
 from pgbench_webapp.config import Config, ensure_dirs, load_config
 from pgbench_webapp.db import connect, migrate
@@ -33,7 +35,7 @@ from pgbench_webapp.secrets_store import SecretStore
 from pgbench_webapp.security import (CSRF_FIELD, SECURITY_HEADERS, SESSION_COOKIE,
                                      hash_password, new_token, verify_password)
 from pgbench_webapp.util import utc_now_iso
-from pgbench_webapp.worker import cancel_job_process, job_password_ref
+from pgbench_webapp.worker import job_password_ref, stop_job_process
 
 _PKG = Path(__file__).resolve().parent
 ROLE_RANK = {"viewer": 1, "operator": 2, "admin": 3}
@@ -322,9 +324,22 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                    conn: sqlite3.Connection = Depends(get_conn),
                    user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, request.headers.get("x-csrf-token"))
-        ok = cancel_job_process(conn, job_id)
+        ok = stop_job_process(cfg, conn, job_id)   # one escalating path (SIGTERM->SIGKILL)
         queries.audit(conn, user["username"], "run_cancel", target=str(job_id))
         return JSONResponse({"canceled": ok})
+
+    @app.post("/api/jobs/{job_id}/stop")
+    def api_stop(job_id: int, request: Request,
+                 conn: sqlite3.Connection = Depends(get_conn),
+                 user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        """Stop an active run: graceful SIGTERM to the process group, escalating to
+        SIGKILL after stop_grace_s. The run converges to 'canceled' when the child
+        dies (no run stays 'live' after a stop)."""
+        _check_csrf(request, request.headers.get("x-csrf-token"))
+        ok = stop_job_process(cfg, conn, job_id)
+        queries.audit(conn, user["username"], "run_stop", target=str(job_id),
+                      detail="sigterm+escalate")
+        return JSONResponse({"stopping": ok})
 
     @app.post("/api/runs/{run_id}/mark")
     def api_mark(run_id: str, request: Request, payload: dict,
@@ -540,7 +555,8 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             except (ValueError, OSError):
                 summary = {}
         return JSONResponse({"mode": mode, "manifest": manifest, "summary": summary,
-                             "pg": (run_dir / "parsed" / "pg_timeseries.csv").exists()})
+                             "pg": (run_dir / "parsed" / "pg_timeseries.csv").exists(),
+                             "pg_settings": _read_pg_settings(run_dir)})
 
     _CSV_FILES = {"samples": "parsed/samples.csv",
                   "timeseries": "parsed/soak_timeseries.csv",
@@ -582,6 +598,38 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                    user: sqlite3.Row = Depends(require("viewer"))) -> StreamingResponse:
         run_dir = cfg.results_dir / run_id
         return StreamingResponse(_sse(cfg, run_dir), media_type="text/event-stream")
+
+    @app.delete("/api/runs/{run_id}")
+    def api_delete_run(run_id: str, request: Request,
+                       conn: sqlite3.Connection = Depends(get_conn),
+                       store: SecretStore = Depends(get_store),
+                       user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        """Delete a run and reclaim its disk: the index row, results/<run_id>/, and
+        ALL owning job rows + their spec/out files + encrypted password refs.
+        Refuses while any owning job is still active (stop it first)."""
+        _check_csrf(request, request.headers.get("x-csrf-token"))
+        run_dir = _run_dir_safe(cfg, run_id)            # traversal guard
+        jobs = queries.jobs_for_run(conn, run_id)
+        if queries.get_run(conn, run_id) is None and not run_dir.exists() and not jobs:
+            raise HTTPException(404, "run not found")
+        if any(j["state"] in ("queued", "running", "canceling") for j in jobs):
+            raise HTTPException(409, "run has an active job; stop it first")
+        # Index/control plane first, bytes second: a crash mid-delete leaves
+        # reclaimable filesystem garbage, never a dangling index row.
+        queries.delete_jobs_for_run(conn, run_id)
+        queries.delete_run(conn, run_id)
+        for j in jobs:                                   # per-job secret + spec/out files
+            try:
+                store.delete(job_password_ref(j["id"]))   # never the shared target secret
+            except Exception:  # noqa: BLE001
+                pass
+            for name in (f"job_{j['id']}.yaml", f"job_{j['id']}.out"):
+                (cfg.data_dir / "jobs" / name).unlink(missing_ok=True)
+        if run_dir.exists():
+            shutil.rmtree(run_dir, ignore_errors=True)
+        queries.audit(conn, user["username"], "run_delete", target=run_id,
+                      detail=f"jobs={[j['id'] for j in jobs]}")
+        return JSONResponse({"deleted": True})
 
     # ── compare ──
     @app.get("/compare")
@@ -905,6 +953,37 @@ def _safe_segment(ref: str) -> str:
     if not ref or "/" in ref or "\\" in ref or ".." in ref or ref.startswith("."):
         raise HTTPException(400, f"invalid id: {ref!r}")
     return ref
+
+
+def _read_pg_settings(run_dir: Path) -> Optional[dict]:
+    """Captured pg_settings (env/pg_settings.csv) split into the curated key WAL/
+    checkpoint/memory settings + the full list (for a 'show all' expand) so the
+    interactive report reaches parity with the classic one. None if not captured."""
+    import csv as _csv
+    p = run_dir / "env" / "pg_settings.csv"
+    if not p.exists():
+        return None
+    rows: list[dict] = []
+    try:
+        with open(p, newline="", encoding="utf-8") as fh:
+            for r in _csv.DictReader(fh):
+                rows.append({"name": r.get("name", ""), "setting": r.get("setting", ""),
+                             "unit": (r.get("unit") or ""), "source": (r.get("source") or "")})
+    except OSError:
+        return None
+    keyset = set(KEY_SETTINGS)
+    return {"key": [r for r in rows if r["name"] in keyset], "all": rows}
+
+
+def _run_dir_safe(cfg: Config, run_id: str) -> Path:
+    """Resolve results/<run_id> with traversal protection: reject separators/'..'/
+    leading dot AND assert the resolved path stays strictly under results_dir."""
+    seg = _safe_segment(run_id)
+    base = cfg.results_dir.resolve()
+    target = (base / seg).resolve()
+    if target == base or base not in target.parents:
+        raise HTTPException(400, f"invalid run id: {run_id!r}")
+    return target
 
 
 def _spec_with_target(conn: sqlite3.Connection, payload: dict) -> tuple[str, Optional[int]]:

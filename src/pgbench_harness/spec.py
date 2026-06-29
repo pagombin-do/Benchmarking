@@ -82,6 +82,15 @@ class ReportCfg:
     full_recovery_pct: float = 100.0
     recovery_hold_s: int = 10
     latency_spike_mult: float = 2.0
+    # Automatic anomaly detection (soak): a run tells its own story even with no
+    # marked events. All thresholds are echoed into the report for auditability.
+    detect_drop_pct: float = 50.0        # TPS below this % of baseline starts a disruption window
+    detect_recover_pct: float = 90.0     # ...that returns to this % counts as a recovery
+    detect_min_event_s: int = 3          # min consecutive seconds to call a disruption/spike
+    detect_shift_pct: float = 25.0       # sustained level shift => scale up/down candidate
+    detect_shift_window_s: int = 60      # leading/trailing window for the shift comparison
+    detect_err_burst: int = 3            # error/reconnect-seconds within a window => burst
+    detect_max_events: int = 50
 
 
 SOAK_EVENT_TYPES = ("failover", "scale_up", "scale_down", "note", "loadgen_restart")
@@ -108,6 +117,11 @@ class Soak:
     tolerate_errors: bool = True        # keep the load generator alive through outages
     report_interval_s: int = 1
     max_relaunches: int = 50            # supervisor safety cap
+    # Supervisor safety bounds (see runner._soak_supervisor). A run that cannot
+    # produce samples must fail fast with a clear reason, never burn the window.
+    fast_fail_segments: int = 3         # abort after N consecutive zero-sample launches
+    hard_ceiling_grace_s: int = 15      # supervisor wall-clock may exceed duration_s by at most this
+    segment_kill_grace_s: int = 10      # SIGTERM->SIGKILL grace when a segment overruns/hangs
 
 
 @dataclass(frozen=True)
@@ -305,7 +319,10 @@ def _parse_report(sec: dict[str, Any], sweep: Optional[Sweep]) -> ReportCfg:
     _check_keys(sec, "report", set(),
                 {"percentiles", "timeseries_levels", "variance_warn_pct",
                  "baseline_window_s", "recovery_threshold_pct", "full_recovery_pct",
-                 "recovery_hold_s", "latency_spike_mult"})
+                 "recovery_hold_s", "latency_spike_mult",
+                 "detect_drop_pct", "detect_recover_pct", "detect_min_event_s",
+                 "detect_shift_pct", "detect_shift_window_s", "detect_err_burst",
+                 "detect_max_events"})
     pcts = _int_list(sec, "report", "percentiles", (50, 95, 99))
     if any(p < 1 or p > 100 for p in pcts):
         raise SpecError("'report.percentiles' entries must be between 1 and 100")
@@ -342,12 +359,20 @@ def _parse_report(sec: dict[str, Any], sweep: Optional[Sweep]) -> ReportCfg:
         full_recovery_pct=full,
         recovery_hold_s=hold,
         latency_spike_mult=mult,
+        detect_drop_pct=_typed(sec, "report", "detect_drop_pct", float, 50.0),
+        detect_recover_pct=_typed(sec, "report", "detect_recover_pct", float, 90.0),
+        detect_min_event_s=_typed(sec, "report", "detect_min_event_s", int, 3),
+        detect_shift_pct=_typed(sec, "report", "detect_shift_pct", float, 25.0),
+        detect_shift_window_s=_typed(sec, "report", "detect_shift_window_s", int, 60),
+        detect_err_burst=_typed(sec, "report", "detect_err_burst", int, 3),
+        detect_max_events=_typed(sec, "report", "detect_max_events", int, 50),
     )
 
 
 def _parse_soak(sec: dict[str, Any]) -> Soak:
     _check_keys(sec, "soak", {"threads", "duration_s"},
-                {"tolerate_errors", "report_interval_s", "max_relaunches"})
+                {"tolerate_errors", "report_interval_s", "max_relaunches",
+                 "fast_fail_segments", "hard_ceiling_grace_s", "segment_kill_grace_s"})
     threads = _typed(sec, "soak", "threads", int)
     duration = _typed(sec, "soak", "duration_s", int)
     if threads < 1:
@@ -357,12 +382,22 @@ def _parse_soak(sec: dict[str, Any]) -> Soak:
     interval = _typed(sec, "soak", "report_interval_s", int, 1)
     if interval < 1:
         raise SpecError("'soak.report_interval_s' must be >= 1")
+    fast_fail = _typed(sec, "soak", "fast_fail_segments", int, 3)
+    if fast_fail < 1:
+        raise SpecError("'soak.fast_fail_segments' must be >= 1")
+    ceiling_grace = _typed(sec, "soak", "hard_ceiling_grace_s", int, 15)
+    kill_grace = _typed(sec, "soak", "segment_kill_grace_s", int, 10)
+    if ceiling_grace < 0 or kill_grace < 0:
+        raise SpecError("'soak.hard_ceiling_grace_s' / 'segment_kill_grace_s' must be >= 0")
     return Soak(
         threads=threads,
         duration_s=duration,
         tolerate_errors=_typed(sec, "soak", "tolerate_errors", bool, True),
         report_interval_s=interval,
         max_relaunches=_typed(sec, "soak", "max_relaunches", int, 50),
+        fast_fail_segments=fast_fail,
+        hard_ceiling_grace_s=ceiling_grace,
+        segment_kill_grace_s=kill_grace,
     )
 
 

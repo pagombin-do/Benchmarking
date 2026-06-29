@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <title>Resilience — {{ summary.label }} ({{ summary.run_id }})</title>
 <style>{% include "base.css.j2" %}</style>
+{% if uplot_css %}<style>{{ uplot_css | safe }}</style>
+<style>.uchart{margin:10px 0}.uchart .u-title{font-size:14px;font-weight:600}.u-legend{font-size:12px}</style>{% endif %}
 </head>
 <body>
 
@@ -20,29 +22,41 @@
 </div>
 
 <main>
+{% if summary.tldr %}<div class="note" style="font-size:15px;font-weight:600">{{ summary.tldr }}</div>{% endif %}
 <div class="toc">
-  <a href="#overview">Overview</a><a href="#events">Per-event detail</a>
+  <a href="#overview">Overview</a><a href="#detected">Detected</a><a href="#events">Per-event detail</a>
   <a href="#timeline">Timeline</a><a href="#method">Methodology</a>
 </div>
 
-{# ── Per-event KPI band + verdicts ──────────────────────────────── #}
-{% if summary.events %}
+{# ── Always-on run-profile KPI band (rich even with no marked event) ── #}
+{% set rp = summary.run_profile or {} %}
+{% set lat = rp.latency_ms or {} %}
 <div class="kpis">
-  {% for ev in summary.events %}
-  {% set m = ev.metrics %}
-  <div class="kpi {% if m.hard_downtime_s > 0 %}bad{% elif m.ttr_s is not none %}good{% endif %}">
-    <div class="v">{{ m.hard_downtime_s }}<small> s</small></div>
-    <div class="k">{{ ev.label or ev.type }} · hard downtime</div>
-  </div>
-  {% endfor %}
+  <div class="kpi"><div class="v">{{ rp.tps.median if rp.tps else "—" }}</div><div class="k">median TPS</div></div>
+  <div class="kpi"><div class="v">{{ lat.p99 if lat.p99 is not none else "—" }}<small> ms</small></div><div class="k">p99 latency (run)</div></div>
+  <div class="kpi {% if rp.tps and rp.tps.cov_pct > 15 %}warn{% endif %}"><div class="v">{{ rp.tps.cov_pct if rp.tps else "—" }}<small> %</small></div><div class="k">TPS variability (CoV)</div></div>
+  <div class="kpi {% if rp.longest_outage_s %}bad{% endif %}"><div class="v">{{ rp.zero_or_gap_seconds if rp.zero_or_gap_seconds is defined else "—" }}<small> s</small></div><div class="k">zero / gap seconds</div></div>
+  <div class="kpi"><div class="v">{{ summary.coverage_pct }}<small> %</small></div><div class="k">coverage</div></div>
+  <div class="kpi"><div class="v">{{ summary.events | length }}</div><div class="k">confirmed events</div></div>
 </div>
+{% if summary.events %}
 {% for ev in summary.events %}
 <div class="note" style="font-size:15px"><b>{{ ev.label or ev.type }}</b> — {{ ev.verdict }}</div>
 {% endfor %}
 {% else %}
-<div class="warnbox">No events were marked on this run. Use
+<div class="note subtle">No events were marked — the run profile and the detected
+anomalies below characterize it. To label a moment, run
 <code>pgbench-harness mark --run-dir &lt;dir&gt; --type failover --label "..."</code>
 during the soak, or declare <code>events:</code> in the spec.</div>
+{% endif %}
+
+{% if summary.status == "failed" and summary.failure_reason %}
+<div class="warnbox" style="border-left:4px solid #c0392b">
+  <b>Run failed — the load generator could not sustain load against the target.</b>
+  {% if summary.failed_segments %}<div style="margin-top:4px">{{ summary.failed_segments }} failed segment(s).</div>{% endif %}
+  <div style="margin-top:6px">Last sysbench error:</div>
+  <pre style="white-space:pre-wrap;margin:4px 0 0;font-size:13px">{{ summary.failure_reason }}</pre>
+</div>
 {% endif %}
 
 {% if summary.warnings %}
@@ -69,11 +83,122 @@ during the soak, or declare <code>events:</code> in the spec.</div>
   {% if summary.notes %}<p style="margin-bottom:0"><b>Notes:</b> {{ summary.notes }}</p>{% endif %}
 </div>
 {% if charts.overview %}<div class="chart"><img alt="Throughput over the full run" src="{{ charts.overview }}">
-  <div class="cap">Whole run, decimated for legibility; per-bucket minimum is shaded so brief dips/outages are visible. Red lines = events; red shading = disruption window.</div>
+  <div class="cap">Whole run, decimated for legibility; per-bucket minimum is shaded so brief dips/outages are visible. Solid red = confirmed events; dashed amber = auto-detected (unconfirmed) anomalies.</div>
 </div>{% endif %}
 
+{# ── Run profile (steady-state, tail latency, stability) — always ── #}
+{% if rp %}
+<div class="card soft">
+  <h3 style="margin-top:0">Steady-state &amp; stability{% if rp.warmup_excluded_s %} <span class="subtle">(first {{ rp.warmup_excluded_s }}s excluded as warm-up)</span>{% endif %}</h3>
+  <div class="meta-grid">
+    {% if rp.tps %}<div><b>TPS:</b> median {{ rp.tps.median }} · mean {{ rp.tps.mean }} · min {{ rp.tps.min }} · max {{ rp.tps.max }} · CoV {{ rp.tps.cov_pct }}%</div>{% endif %}
+    {% if rp.qps %}<div><b>QPS:</b> median {{ rp.qps.median }} · r/w/o means {{ rp.qps_read_mean }}/{{ rp.qps_write_mean }}/{{ rp.qps_other_mean }}</div>{% endif %}
+    {% if lat %}<div><b>Latency (ms, whole run):</b>
+      {% if lat.p50 is not none %}p50 {{ lat.p50 }} · {% endif %}{% if lat.p95 is not none %}p95 {{ lat.p95 }} · {% endif %}{% if lat.p99 is not none %}p99 {{ lat.p99 }} · {% endif %}min {{ lat.min if lat.min is defined else "—" }} · avg {{ lat.avg if lat.avg is defined else "—" }} · max {{ lat.max if lat.max is defined else "—" }}</div>{% endif %}
+    <div><b>Stability:</b> {{ rp.dip_seconds }} dip s (&lt;50% median) · {{ rp.zero_or_gap_seconds }} zero/gap s · longest outage {{ rp.longest_outage_s }}s · {{ rp.error_seconds }} error/reconnect s</div>
+  </div>
+  <p class="subtle" style="margin-bottom:0">Per-second latency is p99 only (sysbench emits one percentile per interval); p50/p95/min/avg/max are whole-run figures from the segments' end-of-run histogram + summary.</p>
+</div>
+{% endif %}
+
+{# ── Interactive per-second timeline (inline uPlot; offline & self-contained) ── #}
+{% if interactive %}
+<h3 id="interactive">Interactive timeline <span class="subtle">— hover to inspect; solid red = confirmed events, dashed amber = auto-detected</span></h3>
+<div class="card"><div id="ic-throughput" class="uchart"></div></div>
+<div class="card"><div id="ic-qpsrwo" class="uchart"></div></div>
+<div class="card"><div id="ic-p99" class="uchart"></div></div>
+<div class="card"><div id="ic-errors" class="uchart"></div></div>
+{% if interactive.pg %}
+<div class="section-label">PostgreSQL (engine-side) <span class="subtle">— from the server's own counters; an IOPS-proxy, not device metrics</span></div>
+<div class="card"><div id="ic-commits" class="uchart"></div></div>
+<div class="card"><div id="ic-cache" class="uchart"></div></div>
+<div class="card"><div id="ic-wal" class="uchart"></div></div>
+<div class="card"><div id="ic-blocks" class="uchart"></div></div>
+{% endif %}
+<script>{{ uplot_js | safe }}</script>
+<script>
+(function(){
+  var D = {{ interactive | tojson }};
+  function vlines(markers){
+    return function(u){
+      var c=u.ctx; c.save(); c.lineWidth=1;
+      (markers||[]).forEach(function(m){
+        var x=Math.round(u.valToPos(m.t,'x',true));
+        c.strokeStyle = m.kind==='event' ? '#c0392b' : '#e8a33d';
+        c.setLineDash(m.kind==='event'?[]:[4,3]);
+        c.beginPath(); c.moveTo(x,u.bbox.top); c.lineTo(x,u.bbox.top+u.bbox.height); c.stroke();
+      });
+      c.restore();
+    };
+  }
+  function mk(id,title,xs,defs,markers){
+    var el=document.getElementById(id); if(!el||!xs||!xs.length) return;
+    var w=el.clientWidth||900;
+    var data=[xs].concat(defs.map(function(d){return d.values;}));
+    var series=[{}].concat(defs.map(function(d){
+      return {label:d.label,stroke:d.stroke,width:1.5,scale:d.scale||'y',points:{show:false}};
+    }));
+    var axes=[{stroke:'#8b97a6',grid:{stroke:'rgba(139,151,166,0.16)'}},
+              {scale:'y',stroke:'#8b97a6',grid:{stroke:'rgba(139,151,166,0.16)'},size:60}];
+    if(defs.some(function(d){return d.scale==='y2';}))
+      axes.push({scale:'y2',side:1,stroke:'#8b97a6',grid:{show:false},size:60});
+    var u=new uPlot({title:title,width:w,height:200,cursor:{drag:{x:true,y:false}},
+      legend:{live:true},scales:{x:{time:false}},axes:axes,series:series,
+      hooks:{draw:[vlines(markers)]}}, data, el);
+    window.addEventListener('resize',function(){u.setSize({width:el.clientWidth||900,height:200});});
+  }
+  mk('ic-throughput','Throughput (TPS / QPS)',D.t,[
+    {label:'TPS',values:D.tps,stroke:'#159a8a'},
+    {label:'QPS',values:D.qps,stroke:'#2f6fed',scale:'y2'}],D.markers);
+  mk('ic-qpsrwo','QPS — read / write / other',D.t,[
+    {label:'read',values:D.qps_r,stroke:'#2e8b57'},
+    {label:'write',values:D.qps_w,stroke:'#b9770e'},
+    {label:'other',values:D.qps_o,stroke:'#7d5bbe'}],D.markers);
+  mk('ic-p99','p99 latency (ms) — per second',D.t,[
+    {label:'p99 ms',values:D.lat_p99,stroke:'#c0392b'}],D.markers);
+  mk('ic-errors','Errors & reconnects (per second)',D.t,[
+    {label:'errors/s',values:D.err_s,stroke:'#c0392b'},
+    {label:'reconnects/s',values:D.reconn_s,stroke:'#7d5bbe'}],D.markers);
+  if(D.pg){var P=D.pg;
+    mk('ic-commits','Transactions — commits / rollbacks (per second)',P.t,[
+      {label:'commits/s',values:P.commits_s,stroke:'#159a8a'},
+      {label:'rollbacks/s',values:P.rollbacks_s,stroke:'#c0392b'}],[]);
+    mk('ic-cache','Cache hit % (interval)',P.t,[
+      {label:'cache hit %',values:P.cache_hit_pct,stroke:'#159a8a'}],[]);
+    mk('ic-wal','WAL throughput (MB/s)',P.t,[
+      {label:'WAL MB/s',values:P.wal_mb_s,stroke:'#c0392b'}],[]);
+    mk('ic-blocks','Block I/O — read vs hit (per second)',P.t,[
+      {label:'blks read/s',values:P.blks_read_s,stroke:'#c0392b'},
+      {label:'blks hit/s',values:P.blks_hit_s,stroke:'#159a8a'}],[]);
+  }
+})();
+</script>
+{% endif %}
+
+{# ── Detected anomalies (auto) — always ─────────────────────────── #}
+{% if summary.detected %}
+<h2 id="detected"><span class="secno">2</span>Detected anomalies <span class="subtle">— automatic, unconfirmed</span></h2>
+<p class="subtle">Candidate events found by scanning the per-second series (thresholds in Methodology). Confirm/label one with <code>pgbench-harness mark</code> and it moves to the per-event analysis below.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Type</th><th>At</th><th>Window (s)</th><th>Confidence</th><th>Evidence</th></tr></thead>
+  <tbody>
+  {% for c in summary.detected %}
+  <tr>
+    <td>{{ c.type }}</td>
+    <td>{{ fmt_duration(c.at_s) }}</td>
+    <td>{{ c.end_s - c.at_s + 1 }}</td>
+    <td>{{ (c.confidence * 100) | int }}%</td>
+    <td class="subtle">{% for k, v in c.evidence.items() %}{{ k }}={{ v }}{% if not loop.last %}, {% endif %}{% endfor %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+
 {# ── Per-event detail ───────────────────────────────────────────── #}
-<h2 id="events"><span class="secno">2</span>Per-event disruption</h2>
+<h2 id="events"><span class="secno">3</span>Per-event disruption <span class="subtle">— confirmed events</span></h2>
 {% if summary.events %}
 <div class="table-wrap">
 <table>
@@ -113,7 +238,7 @@ during the soak, or declare <code>events:</code> in the spec.</div>
 {% endif %}
 
 {# ── Timeline / artifacts ───────────────────────────────────────── #}
-<h2 id="timeline"><span class="secno">3</span>Timeline &amp; artifacts</h2>
+<h2 id="timeline"><span class="secno">4</span>Timeline &amp; artifacts</h2>
 <p class="subtle">Full 1 Hz series: <code>parsed/soak_timeseries.csv</code> ·
 machine-readable summary: <code>parsed/soak_summary.json</code> ·
 events: <code>events.jsonl</code> · raw logs: <code>raw/soak_seg*.log</code>
@@ -133,7 +258,7 @@ events: <code>events.jsonl</code> · raw logs: <code>raw/soak_seg*.log</code>
 {% endif %}
 
 {# ── Methodology ────────────────────────────────────────────────── #}
-<h2 id="method"><span class="secno">4</span>Methodology &amp; definitions</h2>
+<h2 id="method"><span class="secno">5</span>Methodology &amp; definitions</h2>
 <div class="card soft" style="font-size:14px">
   <p>Continuous load at fixed concurrency ({{ summary.soak.threads }} threads); the load
   generator is kept alive across the event by a supervisor that relaunches sysbench if it
@@ -154,6 +279,13 @@ events: <code>events.jsonl</code> · raw logs: <code>raw/soak_seg*.log</code>
     <li><b>Peak p99</b> / seconds above {{ summary.thresholds.latency_spike_mult }}× baseline p99.</li>
     <li><b>Failed txns</b> — sysbench-reported errors in the window. <b>Missed vs baseline</b> —
       Σ max(0, baseline TPS − observed TPS): estimated transactions not served vs baseline.</li>
+    <li><b>Auto-detection</b> — disruption window = TPS &lt; {{ summary.thresholds.detect_drop_pct | int }}% of baseline
+      for ≥ {{ summary.thresholds.detect_min_event_s }}s (mostly-zero ⇒ downtime; recovers to
+      ≥ {{ summary.thresholds.detect_recover_pct | int }}% ⇒ failover-like; else a dip). Latency spike =
+      p99 &gt; {{ summary.thresholds.latency_spike_mult }}× baseline for ≥ {{ summary.thresholds.detect_min_event_s }}s;
+      error burst = ≥ {{ summary.thresholds.detect_err_burst }} error/reconnect seconds; level shift ≥
+      {{ summary.thresholds.detect_shift_pct | int }}% ⇒ scale up/down. All are <i>detected, unconfirmed</i>
+      until an operator marks them.</li>
   </ul>
 </div>
 </main>

@@ -28,6 +28,12 @@ from pgbench_harness.parser import parse_interval_line
 from pgbench_harness.spec import Spec
 from pgbench_harness.util import atomic_write_json, atomic_write_text, fmt_duration
 
+# Columns of parsed/soak_timeseries.csv. Shared so the live incremental writer
+# (runner._soak_supervisor) and the canonical finalize writer (_write_timeseries)
+# can never drift apart.
+TIMESERIES_COLUMNS = ["t", "ts_utc", "tps", "qps", "lat_p99", "err_s", "reconn_s",
+                      "threads", "seg", "qps_r", "qps_w", "qps_o", "lat_p99_pct"]
+
 EPS = 1e-9  # tps at/below this counts as "no successful transactions"
 MIN_BASELINE_SAMPLES = 5  # need at least this many clean pre-event samples to trust a baseline
 ANALYSIS_TYPES = ("failover", "scale_up", "scale_down", "note")  # loadgen_restart is internal
@@ -94,6 +100,11 @@ def build_timeline(run_dir: Path, soak_start: datetime) -> dict[int, dict[str, A
                 "tps": sample.tps, "qps": sample.qps, "lat_p99": sample.lat_ms,
                 "err_s": sample.err_s, "reconn_s": sample.reconn_s,
                 "threads": sample.threads, "seg": seg,
+                # read/write/other QPS split + the per-interval percentile label
+                # (sysbench emits ONE percentile per interval — the --percentile
+                # value, 99 — so lat_p99 is p99-per-second; p50/p95 are run-level).
+                "qps_r": sample.r, "qps_w": sample.w, "qps_o": sample.o,
+                "lat_p99_pct": sample.lat_pct,
             }
     return timeline
 
@@ -278,6 +289,123 @@ def _verdict(ev: dict[str, Any], m: dict[str, Any], cfg: Any) -> str:
     return f"{name}: " + "; ".join(parts) + "." + tail
 
 
+def _stats(vals: list[float]) -> dict[str, Any]:
+    """mean/median/min/max/stdev + coefficient of variation for a metric."""
+    if not vals:
+        return {}
+    mean = statistics.fmean(vals)
+    sd = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+    return {"mean": round(mean, 1), "median": round(statistics.median(vals), 1),
+            "min": round(min(vals), 1), "max": round(max(vals), 1),
+            "stdev": round(sd, 1),
+            "cov_pct": round(100.0 * sd / mean, 1) if mean > 0 else 0.0}
+
+
+def _segment_latency_aggregate(run_dir: Path, percentiles: tuple[int, ...]) -> dict[str, Any]:
+    """Whole-run tail latency from the finished segments' end-of-run blocks.
+
+    sysbench emits percentiles only at a run's end, so for a (segmented) soak we
+    merge each segment's --histogram (count-weighted) for p50/p95/p99 and take
+    min / count-weighted avg / max from the segment summaries. Reuses the parser
+    (no forked percentile math). Empty when no segment produced a summary (e.g.
+    the field failure: every segment died before its final block)."""
+    from pgbench_harness.parser import parse_log_file, percentile_from_histogram
+    merged: dict[float, int] = {}
+    mins: list[float] = []
+    maxs: list[float] = []
+    avg_weighted: list[tuple[float, int]] = []
+    for log in sorted((run_dir / "raw").glob("soak_seg*.log")):
+        p = parse_log_file(log)
+        for value, count in p.histogram:
+            merged[value] = merged.get(value, 0) + count
+        if p.summary:
+            mins.append(p.summary.lat_min)
+            maxs.append(p.summary.lat_max)
+            avg_weighted.append((p.summary.lat_avg, max(1, p.summary.transactions)))
+    if not merged and not mins:
+        return {}
+    buckets = sorted(merged.items())
+    out: dict[str, Any] = {}
+    for pct in percentiles:
+        v = percentile_from_histogram(buckets, pct)
+        out[f"p{pct}"] = round(v, 1) if v is not None else None
+    if mins:
+        out["min"] = round(min(mins), 1)
+    if maxs:
+        out["max"] = round(max(maxs), 1)
+    if avg_weighted:
+        tot = sum(n for _, n in avg_weighted) or 1
+        out["avg"] = round(sum(a * n for a, n in avg_weighted) / tot, 1)
+    return out
+
+
+def build_run_profile(tl: dict[int, dict[str, Any]], horizon: int,
+                      percentiles: tuple[int, ...], run_dir: Path) -> dict[str, Any]:
+    """Whole-run characterization computed for EVERY soak (event or not): steady-
+    state throughput, tail latency, and stability/variance — so an event-less run
+    still leads with rich signal instead of a near-blank page."""
+    present = sorted(tl)
+    warm = 30 if sum(1 for o in present if o > 30) >= 10 else 0
+    steady = [o for o in present if o >= warm]   # >= so a tiny run keeps its samples
+    tps = [tl[o]["tps"] for o in steady]
+    qps = [tl[o]["qps"] for o in steady]
+    span = horizon + 1
+    med = statistics.median(tps) if tps else 0.0
+    dip_thresh = 0.5 * med
+    # contiguous zero/gap run length (an outage), longest wins
+    longest = cur = 0
+    for o in range(present[0] if present else 0, span):
+        if o not in tl or tl[o]["tps"] <= EPS:
+            cur += 1
+            longest = max(longest, cur)
+        else:
+            cur = 0
+
+    def _mean(key: str) -> float:
+        vals = [tl[o].get(key, 0.0) or 0.0 for o in steady]
+        return round(statistics.fmean(vals), 1) if vals else 0.0
+
+    return {
+        "warmup_excluded_s": warm,
+        "steady_samples": len(steady),
+        "tps": _stats(tps),
+        "qps": _stats(qps),
+        "qps_read_mean": _mean("qps_r"),
+        "qps_write_mean": _mean("qps_w"),
+        "qps_other_mean": _mean("qps_o"),
+        "latency_ms": _segment_latency_aggregate(run_dir, percentiles),
+        "dip_seconds": sum(1 for o in steady if EPS < tl[o]["tps"] < dip_thresh),
+        "zero_or_gap_seconds": sum(1 for o in range(span)
+                                   if o not in tl or tl[o]["tps"] <= EPS),
+        "longest_outage_s": longest,
+        "error_seconds": sum(1 for o in present
+                             if tl[o]["err_s"] > 0 or tl[o]["reconn_s"] > 0),
+    }
+
+
+def _soak_tldr(status: str, soak_cfg: dict[str, Any], total_s: int,
+               rp: dict[str, Any], detected: list[dict[str, Any]],
+               events: list[dict[str, Any]]) -> str:
+    """One-line auto-generated verdict — the sentence for a status update. Leads
+    the report so it tells the story first (the MySQL artifact has no narrative)."""
+    import collections
+    parts = [f"{soak_cfg.get('threads', '?')} threads for {fmt_duration(total_s)}"]
+    if rp.get("tps"):
+        parts.append(f"median {rp['tps']['median']:.0f} TPS")
+    lat = rp.get("latency_ms") or {}
+    if lat.get("p99") is not None:
+        parts.append(f"p99 {lat['p99']:.0f} ms")
+    out = rp.get("longest_outage_s", 0)
+    parts.append(f"{out}s longest outage" if out else "no downtime")
+    if detected:
+        c = collections.Counter(d["type"] for d in detected)
+        parts.append(f"{len(detected)} detected ("
+                     + ", ".join(f"{n} {t}" for t, n in c.items()) + ")")
+    if events:
+        parts.append(f"{len(events)} confirmed event(s)")
+    return "Soak: " + "; ".join(parts) + f" — status: {status}."
+
+
 def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[str, Any]:
     """Build timeline + summary, write soak_timeseries.csv and soak_summary.json."""
     assert spec.soak is not None
@@ -336,6 +464,25 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
     else:
         status = "complete"
 
+    # Surface WHY a soak produced little/no data so a failed run is never an
+    # indistinguishable blank: the load generator's own error, lifted from the
+    # per-segment records the supervisor now captures (runner._segment_error_excerpt).
+    seg_list = manifest_soak.get("segments", [])
+    failed_segments = sum(1 for s in seg_list
+                          if s.get("exit_code") not in (0, None) or s.get("intervals", 0) == 0)
+    failure_reason = manifest_soak.get("failure_excerpt") or next(
+        (s.get("error_excerpt") for s in seg_list if s.get("error_excerpt")), "")
+    if status == "failed" and failure_reason:
+        warnings.append("load generator never produced samples; last sysbench error: "
+                        + failure_reason.splitlines()[0])
+
+    # Always-rich characterization + automatic event detection (event or not).
+    from pgbench_harness import detect
+    run_profile = build_run_profile(tl, horizon, spec.report.percentiles, run_dir)
+    detected = detect.detect_anomalies(tl, baseline_tps, baseline_lat, horizon, spec.report)
+    tldr = _soak_tldr(status, dict(spec.raw.get("soak", {})), total_s,
+                      run_profile, detected, out_events)
+
     _write_timeseries(run_dir, tl, horizon)
     summary = {
         "run_id": manifest_soak.get("run_id"),
@@ -352,7 +499,12 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
         "coverage_pct": round(coverage * 100, 1),
         "gaps_s": span - len(present),
         "relaunches": manifest_soak.get("relaunches", 0),
-        "segments": manifest_soak.get("segments", []),
+        "segments": seg_list,
+        "failed_segments": failed_segments,
+        "failure_reason": failure_reason,
+        "run_profile": run_profile,
+        "detected": detected,
+        "tldr": tldr,
         "warnings": warnings,
         "baseline": {
             "window_s": [bw[0], bw[1]], "tps": round(baseline_tps, 1),
@@ -365,6 +517,11 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
             "full_recovery_pct": spec.report.full_recovery_pct,
             "recovery_hold_s": spec.report.recovery_hold_s,
             "latency_spike_mult": spec.report.latency_spike_mult,
+            "detect_drop_pct": spec.report.detect_drop_pct,
+            "detect_recover_pct": spec.report.detect_recover_pct,
+            "detect_min_event_s": spec.report.detect_min_event_s,
+            "detect_shift_pct": spec.report.detect_shift_pct,
+            "detect_err_burst": spec.report.detect_err_burst,
         },
         "events": out_events,
     }
@@ -376,9 +533,8 @@ def _write_timeseries(run_dir: Path, tl: dict[int, dict[str, Any]], horizon: int
     """Full-resolution per-second series (present rows only) for overlay/export."""
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["t", "ts_utc", "tps", "qps", "lat_p99", "err_s", "reconn_s", "threads", "seg"])
+    w.writerow(TIMESERIES_COLUMNS)
     for o in sorted(tl):
         r = tl[o]
-        w.writerow([o, r["ts_utc"], r["tps"], r["qps"], r["lat_p99"],
-                    r["err_s"], r["reconn_s"], r["threads"], r["seg"]])
+        w.writerow([r.get(c, "") for c in TIMESERIES_COLUMNS])
     atomic_write_text(run_dir / "parsed" / "soak_timeseries.csv", buf.getvalue())

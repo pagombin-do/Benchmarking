@@ -208,6 +208,106 @@ def test_cancel_queued_job(web):
     conn.close()
 
 
+def test_stop_route_rbac_audit_and_queued(web):
+    """/stop: operator+ only, audited, and short-circuits a queued job to canceled."""
+    client, cfg = web
+    job_id = client.post("/api/runs", json={"spec_yaml": _spec_yaml()}, auth=("op", "oppw")).json()["job_id"]
+    assert client.post(f"/api/jobs/{job_id}/stop", auth=("viewer", "vpw")).status_code == 403
+    r = client.post(f"/api/jobs/{job_id}/stop", auth=("op", "oppw"))
+    assert r.status_code == 200 and r.json()["stopping"] is True
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    conn = connect(cfg.db_path)
+    assert queries.get_job(conn, job_id)["state"] == "canceled"     # queued -> canceled
+    assert any(a["action"] == "run_stop" for a in queries.list_audit(conn))
+    conn.close()
+
+
+def test_stop_escalates_to_sigkill(web):
+    """A running child that ignores SIGTERM is SIGKILLed after stop_grace_s, and
+    the whole process group (leader + children) is reaped."""
+    import subprocess
+    client, cfg = web
+    from pgbench_webapp import queries, worker
+    from pgbench_webapp.db import connect
+    conn = connect(cfg.db_path)
+    queries.set_setting(conn, "stop_grace_s", "0.5")
+    # mimic the harness child: own session, ignores SIGTERM, spawns a grandchild
+    code = ("import signal,os,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "os.fork() if hasattr(os,'fork') else None;time.sleep(60)")
+    proc = subprocess.Popen(["python3", "-c", code], start_new_session=True)
+    jid = queries.enqueue_job(conn, "soak", "x", None, "op")
+    queries.update_job(conn, jid, state="running", pid=proc.pid)
+    assert worker.stop_job_process(cfg, conn, jid) is True
+    assert queries.get_job(conn, jid)["state"] == "canceling"
+    proc.wait(timeout=5)                                # escalation SIGKILLs within grace
+    assert proc.returncode is not None and proc.returncode != 0
+    conn.close()
+
+
+def test_delete_run_removes_all_artifacts(web):
+    """Delete reclaims everything: index row, results dir, job row(s), per-job
+    spec/out files, and the encrypted password ref — but not the shared target."""
+    client, cfg = web
+    from pgbench_webapp import queries, worker
+    from pgbench_webapp.db import connect
+    from pgbench_webapp.secrets_store import SecretStore
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    jid, _, _ = _run_worker_once(cfg)
+    conn = connect(cfg.db_path)
+    rid = queries.get_job(conn, jid)["run_id"]
+    assert rid
+    store = SecretStore(cfg.secret_key_path, cfg.data_dir / "secrets.enc")
+    store.set(worker.job_password_ref(jid), "lingering-secret")     # simulate uncleaned secret
+    out_f = cfg.data_dir / "jobs" / f"job_{jid}.out"
+    out_f.write_text("log")
+    run_dir = cfg.results_dir / rid
+    assert run_dir.exists()
+
+    r = client.request("DELETE", f"/api/runs/{rid}", auth=("op", "oppw"))
+    assert r.status_code == 200 and r.json()["deleted"] is True
+    assert queries.get_run(conn, rid) is None
+    assert queries.jobs_for_run(conn, rid) == []
+    assert not run_dir.exists() and not out_f.exists()
+    assert not (cfg.data_dir / "jobs" / f"job_{jid}.yaml").exists()
+    assert store.get(worker.job_password_ref(jid)) is None
+    assert any(a["action"] == "run_delete" for a in queries.list_audit(conn))
+    conn.close()
+
+
+def test_delete_run_refuses_active_job(web):
+    """A run with an active job must not be deletable — stop it first (409)."""
+    client, cfg = web
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    rid = "active-20260101T000000Z"
+    (cfg.results_dir / rid).mkdir(parents=True)
+    (cfg.results_dir / rid / "manifest.json").write_text(
+        '{"run_id":"%s","status":"running"}' % rid)
+    conn = connect(cfg.db_path)
+    jid = queries.enqueue_job(conn, "soak", "x", None, "op")
+    queries.update_job(conn, jid, state="running", run_id=rid)
+    assert client.request("DELETE", f"/api/runs/{rid}", auth=("op", "oppw")).status_code == 409
+    assert (cfg.results_dir / rid).exists()       # untouched
+    conn.close()
+
+
+def test_delete_run_rbac_and_traversal(web):
+    """Delete is operator+; the path resolver rejects traversal."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    from pgbench_webapp.app import _run_dir_safe
+    client, cfg = web
+    rid = "view-20260101T000000Z"
+    (cfg.results_dir / rid).mkdir(parents=True)
+    (cfg.results_dir / rid / "manifest.json").write_text("{}")
+    assert client.request("DELETE", f"/api/runs/{rid}", auth=("viewer", "vpw")).status_code == 403
+    for bad in ("..", "../etc", "a/b", ".hidden"):
+        with _pytest.raises(HTTPException):
+            _run_dir_safe(cfg, bad)
+
+
 # ── secrets-leak gate (extended across web/DB/logs/audit/API) ───────
 
 def test_secret_never_leaks_anywhere(web):
@@ -379,6 +479,66 @@ def test_reconcile_indexes_filesystem(web, tmp_path):
     conn = connect(cfg.db_path)
     index.reconcile(conn, cfg.results_dir)
     assert queries.get_run(conn, "cli-made-20260101T000000Z") is not None
+    conn.close()
+
+
+def _stuck_run(cfg, rid: str) -> Path:
+    rd = cfg.results_dir / rid
+    rd.mkdir(parents=True)
+    (rd / "manifest.json").write_text(json.dumps({
+        "run_id": rid, "label": "stuck", "edition": "advanced", "tshirt_size": "8c32g",
+        "mode": "soak", "status": "running", "created_utc": "2026-01-01T00:00:00Z"}))
+    return rd
+
+
+def test_terminal_job_converges_stuck_running_run(web):
+    """A run left non-terminal on disk whose owning job has ended must be driven
+    to a terminal status — no run shows 'live' after its job is failed/canceled."""
+    client, cfg = web
+    from pgbench_webapp import index, queries
+    from pgbench_webapp.db import connect
+    rid = "stuck-20260101T000000Z"
+    rd = _stuck_run(cfg, rid)
+    conn = connect(cfg.db_path)
+    jid = queries.enqueue_job(conn, "soak", "run:\n  label: stuck\n", None, "op")
+    queries.update_job(conn, jid, state="failed", run_id=rid)
+    index.reconcile(conn, cfg.results_dir)              # app/worker startup path
+    assert queries.get_run(conn, rid)["status"] == "failed"   # not 'running'
+    man = json.loads((rd / "manifest.json").read_text())
+    assert man["status"] == "failed" and man["finished_utc"]
+    conn.close()
+
+
+def test_running_job_not_converged(web):
+    """A genuinely live run (owning job still running) must stay 'running'."""
+    client, cfg = web
+    from pgbench_webapp import index, queries
+    from pgbench_webapp.db import connect
+    rid = "live-20260101T000000Z"
+    _stuck_run(cfg, rid)
+    conn = connect(cfg.db_path)
+    jid = queries.enqueue_job(conn, "soak", "run:\n  label: live\n", None, "op")
+    queries.update_job(conn, jid, state="running", run_id=rid)
+    index.reconcile(conn, cfg.results_dir)
+    assert queries.get_run(conn, rid)["status"] == "running"
+    conn.close()
+
+
+def test_failed_soak_run_is_terminal_via_worker(web, monkeypatch):
+    """End-to-end through the queue: a soak whose load generator fails leaves the
+    run row terminal (the A4 'Tasks=failed but Runs=live' regression)."""
+    client, cfg = web
+    monkeypatch.setenv("FAKE_SYSBENCH_RUN_FAIL_THREADS", "2")  # soak spec uses 2 threads
+    r = client.post("/api/runs", json={"spec_yaml": _spec_yaml("soak"), "password": WEB_PW},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    jid, state, _ = _run_worker_once(cfg)
+    assert state == "failed"
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    conn = connect(cfg.db_path)
+    rid = queries.get_job(conn, jid)["run_id"]
+    assert rid and queries.get_run(conn, rid)["status"] == "failed"   # NOT 'running'
     conn.close()
 
 
@@ -592,6 +752,11 @@ def test_interactive_report_summary_and_csv(web):
     assert body.status_code == 200
     j = body.json()
     assert j["mode"] in ("sweep", "soak") and "manifest" in j and "summary" in j
+    # B6: the interactive report gets the captured DB config (curated key settings
+    # + a full list for "show all"), reaching parity with the classic report.
+    ps = j["pg_settings"]
+    assert ps and any(r["name"] == "shared_buffers" for r in ps["key"])
+    assert len(ps["all"]) >= len(ps["key"]) > 0
     # CSV export (samples present for a sweep run); bad name -> 400; missing run -> 404
     csv = client.get(f"/runs/{run_id}/csv?which=samples", auth=("viewer", "vpw"))
     assert csv.status_code == 200 and "t_offset" in csv.text

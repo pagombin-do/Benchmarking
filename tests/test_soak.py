@@ -4,6 +4,7 @@ validation, and an end-to-end run + mark + report through the CLI."""
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -129,6 +130,47 @@ def test_resolve_baseline_window_defaults() -> None:
     assert resolve_baseline_window({}, 1000, ev, (10, 50)) == (10, 50)  # explicit wins
 
 
+# ── automatic detection + run profile (B1/B2) ──────────────────────
+
+def _flat(tps, lat=10.0, err=0.0, reconn=0.0):
+    return {"tps": tps, "qps": tps * 20, "lat_p99": lat, "err_s": err, "reconn_s": reconn,
+            "qps_r": tps * 10, "qps_w": tps * 7, "qps_o": tps * 3}
+
+
+def test_detect_downtime_failover_and_error_burst() -> None:
+    from pgbench_harness import detect
+    tl = {t: _flat(100) for t in range(0, 60)}
+    for t in range(60, 66):                       # 6s hard outage with errors
+        tl[t] = _flat(0.0, lat=0.0, err=5.0, reconn=1.0)
+    for t in range(66, 120):
+        tl[t] = _flat(100)
+    cands = detect.detect_anomalies(tl, 100.0, 10.0, 119, CFG)
+    dt = next(c for c in cands if c["type"] == "downtime")
+    assert dt["at_s"] == 60 and dt["evidence"]["duration_s"] == 6
+    assert dt["status"] == "detected_unconfirmed" and 0 < dt["confidence"] <= 1
+    assert any(c["type"] == "error_burst" for c in cands)
+
+
+def test_detect_latency_spike_and_no_false_positive_on_steady() -> None:
+    from pgbench_harness import detect
+    tl = {t: _flat(100) for t in range(0, 120)}
+    assert detect.detect_anomalies(tl, 100.0, 10.0, 119, CFG) == []   # steady -> nothing
+    for t in range(40, 45):
+        tl[t] = _flat(100, lat=50.0)              # 5s p99 spike > 2x baseline
+    cands = detect.detect_anomalies(tl, 100.0, 10.0, 119, CFG)
+    assert any(c["type"] == "latency_spike" and c["at_s"] == 40 for c in cands)
+
+
+def test_build_run_profile_aggregates(tmp_path) -> None:
+    from pgbench_harness.soak import build_run_profile
+    tl = {t: _flat(100) for t in range(0, 120)}
+    rp = build_run_profile(tl, 119, (50, 95, 99), tmp_path)  # no raw logs -> latency empty
+    assert rp["tps"]["median"] == 100.0 and rp["tps"]["cov_pct"] == 0.0
+    assert rp["qps_read_mean"] == 1000.0
+    assert rp["zero_or_gap_seconds"] == 0 and rp["longest_outage_s"] == 0
+    assert rp["latency_ms"] == {}
+
+
 # ── spec validation ────────────────────────────────────────────────
 
 def _soak_doc(**over):
@@ -190,11 +232,19 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     # artifacts
     assert (run_dir / "parsed" / "soak_summary.json").exists()
     assert (run_dir / "parsed" / "soak_timeseries.csv").exists()
+    ts_lines = (run_dir / "parsed" / "soak_timeseries.csv").read_text().splitlines()
+    # B3: the read/write/other QPS split + per-interval percentile reach the series
+    assert ts_lines[0].split(",")[-4:] == ["qps_r", "qps_w", "qps_o", "lat_p99_pct"]
+    assert float(ts_lines[1].split(",")[9]) > 0          # qps_r populated, not blank
     assert (run_dir / "events.jsonl").exists()
     assert list(run_dir.glob("raw/soak_seg*.log"))
     summary = json.loads((run_dir / "parsed" / "soak_summary.json").read_text())
     assert summary["mode"] == "soak"
     assert any(e["type"] == "failover" for e in summary["events"])
+    # B1: the always-on run profile is present and populated even on a tiny run
+    assert summary["run_profile"]["tps"] and "detected" in summary
+    # B7: auto-generated narrative verdict leads the report
+    assert summary["tldr"].startswith("Soak:") and "status:" in summary["tldr"]
 
     # mark adds a live event, report regenerates and is mode-aware
     assert main(["mark", "--run-dir", str(run_dir), "--type", "scale_up",
@@ -204,13 +254,104 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     assert "Resilience" in html
     assert "Methodology" in html
     assert "hard downtime" in html
+    assert "Steady-state" in html              # B1: always-on run profile section
     assert "data:image/png;base64," in html
-    assert "overflow: hidden" not in html
+    assert "overflow-y: auto" in html          # root scrolls (uPlot's scoped overflow:hidden is fine)
+    assert "Interactive timeline" in html and "new uPlot(" in html   # B7: inline interactive charts
+    assert 'src="http' not in html and 'href="http' not in html      # offline: no external loads
 
     # secret never reaches any soak artifact
     leaks = [str(p) for p in run_dir.rglob("*")
              if p.is_file() and TEST_PASSWORD.encode() in p.read_bytes()]
     assert not leaks
+
+
+def test_soak_surfaces_failure_and_finalizes(fake_env, tmp_path, monkeypatch) -> None:
+    """A soak whose load generator can't run must FAIL FAST, surface sysbench's
+    own error, and leave a TERMINAL manifest — never an indistinguishable blank,
+    never stuck 'running' (the field-incident regression)."""
+    monkeypatch.setenv("FAKE_SYSBENCH_RUN_FAIL_THREADS", "64")
+    results = tmp_path / "results"
+    spec_path = tmp_path / "soak.yaml"
+    doc = _soak_doc(soak={"threads": 64, "duration_s": 300, "tolerate_errors": True,
+                          "fast_fail_segments": 2}, events=[])
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    t0 = time.monotonic()
+    rc = main(["soak", "--spec", str(spec_path), "--results-dir", str(results)])
+    elapsed = time.monotonic() - t0
+    assert rc == 2                       # RunError -> CLI exit 2 -> worker maps to 'failed'
+    assert elapsed < 30                  # fast-fail in seconds, not the 300s window
+
+    run_dir = sorted(d for d in results.iterdir() if (d / "manifest.json").exists())[-1]
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["status"] == "failed"          # terminal, NOT 'running'
+    assert manifest.get("finished_utc")
+
+    summary = json.loads((run_dir / "parsed" / "soak_summary.json").read_text())
+    assert summary["status"] == "failed"
+    assert "deadlock" in summary["failure_reason"] or "thread_init" in summary["failure_reason"]
+    assert summary["failed_segments"] >= 1
+    assert len(summary["segments"]) == 2           # aborted at the cutoff, did not churn
+    assert all(s["error_excerpt"] for s in summary["segments"])
+
+    # the failure reason is rendered in the report (not a near-blank deliverable)
+    assert main(["report", "--run-dir", str(run_dir)]) == 0
+    html = (run_dir / "soak_report.html").read_text()
+    assert "Run failed" in html and ("deadlock" in html or "thread_init" in html)
+
+    # secret never leaks even on the failure path
+    assert not [p for p in run_dir.rglob("*")
+                if p.is_file() and TEST_PASSWORD.encode() in p.read_bytes()]
+
+
+def test_soak_segment_watchdog_kills_hung_child(fake_env, tmp_path, monkeypatch) -> None:
+    """A segment that connects then hangs (no output, never exits) must be killed
+    by the per-segment watchdog so the supervisor stays bounded and finalizes."""
+    monkeypatch.setenv("FAKE_SYSBENCH_HANG_THREADS", "4")
+    results = tmp_path / "results"
+    spec_path = tmp_path / "soak.yaml"
+    doc = _soak_doc(soak={"threads": 4, "duration_s": 2, "tolerate_errors": True,
+                          "segment_kill_grace_s": 1, "hard_ceiling_grace_s": 3,
+                          "fast_fail_segments": 5}, events=[])
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    t0 = time.monotonic()
+    main(["soak", "--spec", str(spec_path), "--results-dir", str(results)])
+    elapsed = time.monotonic() - t0
+    assert elapsed < 30                  # the hang did not block the supervisor forever
+
+    run_dir = sorted(d for d in results.iterdir() if (d / "manifest.json").exists())[-1]
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["status"] in ("failed", "partial")   # terminal
+    segs = manifest["soak"]["segments"]
+    assert segs and any(s.get("timed_out") for s in segs)
+
+
+def test_live_soak_callback_dedups_offsets(tmp_path) -> None:
+    """The live soak tap appends per-second rows keyed on read-time offset, with
+    build_timeline's first-seen-wins / non-negative dedup, so the live file
+    matches the canonical one at the finalize swap."""
+    from datetime import datetime, timezone
+
+    from pgbench_harness.runner import _live_soak_callback
+    from pgbench_harness.soak import TIMESERIES_COLUMNS
+    from pgbench_harness.summarize import IncrementalCsvWriter
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    live = IncrementalCsvWriter(tmp_path / "ts.csv", TIMESERIES_COLUMNS)
+    cb = _live_soak_callback(live, base, set(), "soak_seg01")
+    line = ("[ 1s ] thds: 4 tps: 10.00 qps: 200.00 (r/w/o: 100.00/66.00/34.00) "
+            "lat (ms,99%): 5.00 err/s 0.00 reconn/s: 0.00")
+    cb("2026-01-01T00:00:01.000000Z", line)   # offset 1
+    cb("2026-01-01T00:00:01.400000Z", line)   # rounds to offset 1 -> deduped
+    cb("2026-01-01T00:00:02.000000Z", line)   # offset 2
+    cb("non-iso", line)                         # unparseable ts -> ignored
+    live.close()
+    rows = (tmp_path / "ts.csv").read_text().splitlines()
+    assert rows[0].startswith("t,ts_utc")
+    assert len(rows) == 3                        # header + 2 unique offsets
+    assert rows[1].startswith("1,") and rows[2].startswith("2,")
 
 
 def test_soak_dry_run(fake_env, tmp_path, capsys) -> None:

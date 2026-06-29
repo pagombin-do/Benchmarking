@@ -130,8 +130,12 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
     head: list[str] = []
     try:
         with open(log_path, "w", encoding="utf-8") as logf:
+            # start_new_session=True: the harness becomes its own session/group
+            # leader (pgid == pid), so a Stop can signal the WHOLE tree (harness +
+            # sysbench grandchild) with one killpg instead of orphaning sysbench.
             proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                    stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                    start_new_session=True)
             queries.update_job(conn, job["id"], pid=proc.pid)
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -166,6 +170,12 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
             fields["run_id"] = run_id
         queries.update_job(conn, job["id"], **fields)
         if run_id:
+            # A terminal job must drive its run to a consistent terminal status —
+            # even when the harness was killed before it could finalize (e.g. a
+            # SIGKILLed stop) — so the run is never re-indexed as 'running' and the
+            # cockpit can leave 'live'. The manifest stays source of truth; this
+            # only overrides a stuck non-terminal one.
+            index.converge_run_status(cfg.results_dir, run_id, state)
             row = index._run_row(cfg.results_dir / run_id)
             if row:
                 row["source"] = "web"
@@ -198,7 +208,8 @@ def _notify(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row, state: str,
 
 def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
     """On worker start, mark orphaned 'running'/'canceling' jobs whose process is
-    gone as interrupted, so the queue isn't wedged after a crash/restart."""
+    gone as interrupted, so the queue isn't wedged after a crash/restart, then
+    converge any run left non-terminal on disk whose owning job has ended."""
     for job in queries.list_jobs(conn, states=("running", "canceling")):
         pid = job["pid"]
         alive = False
@@ -209,9 +220,16 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
             except OSError:
                 alive = False
         if not alive:
-            queries.update_job(conn, job["id"], state="failed", pid=None,
+            # 'canceling' with a dead pid was a stop in flight -> canceled; a
+            # 'running' orphan crashed -> failed (and is resumable for sweeps).
+            terminal = "canceled" if job["state"] == "canceling" else "failed"
+            queries.update_job(conn, job["id"], state=terminal, pid=None,
                                finished_utc=utc_now_iso(),
-                               error="interrupted (worker restart); resume from the run page")
+                               error=("stopped (worker restart)" if terminal == "canceled"
+                                      else "interrupted (worker restart); resume from the run page"))
+    # Converge stuck-running runs against their now-terminal jobs and re-index
+    # the filesystem so no run survives a restart still showing 'live'.
+    index.reconcile(conn, cfg.results_dir)
 
 
 def _run_job_threaded(cfg: Config, store: SecretStore, job_id: int) -> None:
@@ -262,8 +280,47 @@ def worker_loop(cfg: Optional[Config] = None) -> None:
         t.start()
 
 
-def cancel_job_process(conn: sqlite3.Connection, job_id: int) -> bool:
-    """Mark a running job canceling and SIGTERM its child (graceful stop)."""
+def _stop_grace_s(conn: sqlite3.Connection) -> float:
+    """Seconds to wait after SIGTERM before escalating to SIGKILL (admin-tunable)."""
+    try:
+        return max(0.0, float(queries.get_setting(conn, "stop_grace_s", "15") or "15"))
+    except (ValueError, TypeError):
+        return 15.0
+
+
+def _escalate_kill(cfg: Config, job_id: int, pid: int, pgid: int, grace_s: float) -> None:
+    """After the graceful grace, SIGKILL the process group if the job is still
+    canceling and the leader is alive. The worker's run_job records the terminal
+    job state and converges the run status once the child actually dies, so the
+    cockpit leaves 'live' even on a hard kill."""
+    time.sleep(grace_s)
+    conn = connect(cfg.db_path)
+    try:
+        job = queries.get_job(conn, job_id)
+        if job is None or job["state"] != "canceling":
+            return                               # exited gracefully within the grace
+        try:
+            os.kill(pid, 0)                      # leader still alive?
+        except OSError:
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+    finally:
+        conn.close()
+
+
+def stop_job_process(cfg: Config, conn: sqlite3.Connection, job_id: int) -> bool:
+    """Stop a job gracefully, escalating to SIGKILL after a grace period.
+
+    queued -> canceled immediately. running/canceling -> mark canceling and
+    SIGTERM the child's process GROUP (so the sysbench grandchild is reaped too,
+    not just the harness); a daemon watcher SIGKILLs the group if it has not
+    exited within stop_grace_s. SIGKILL cannot be caught, so the terminal
+    manifest/run status is written by run_job / reconcile when the child dies —
+    never relied on from a graceful handler here.
+    """
     job = queries.get_job(conn, job_id)
     if job is None or job["state"] not in ("running", "queued", "canceling"):
         return False
@@ -271,9 +328,18 @@ def cancel_job_process(conn: sqlite3.Connection, job_id: int) -> bool:
         queries.update_job(conn, job_id, state="canceled", finished_utc=utc_now_iso())
         return True
     queries.update_job(conn, job_id, state="canceling")
-    if job["pid"]:
-        try:
-            os.kill(job["pid"], signal.SIGTERM)
-        except OSError:
-            return False
+    pid = job["pid"]
+    if not pid:
+        return True                              # nothing to signal; reconcile finalizes
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return True                              # already gone
+    try:
+        os.killpg(pgid, signal.SIGTERM)          # graceful: reaches harness + sysbench
+    except OSError:
+        return True
+    threading.Thread(target=_escalate_kill,
+                     args=(cfg, job_id, pid, pgid, _stop_grace_s(conn)),
+                     daemon=True).start()
     return True
