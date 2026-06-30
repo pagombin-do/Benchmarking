@@ -352,7 +352,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                  conn: sqlite3.Connection = Depends(get_conn),
                  user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
         etype = payload.get("type", "note")
@@ -365,11 +365,15 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                    conn: sqlite3.Connection = Depends(get_conn),
                    user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, request.headers.get("x-csrf-token"))
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         spec_path = run_dir / "spec.yaml"
         if not spec_path.exists():
             raise HTTPException(404, "run/spec not found")
-        job_id = queries.enqueue_job(conn, "run", spec_path.read_text(), None,
+        # Reuse the original run's saved target so the resumed job has credentials
+        # (enqueuing with target=None left resumed sweeps with no password).
+        prev = queries.job_for_run(conn, run_id)
+        target_id = prev["target_id"] if prev else None
+        job_id = queries.enqueue_job(conn, "run", spec_path.read_text(), target_id,
                                      user["username"], resume_run_id=run_id)
         queries.audit(conn, user["username"], "run_resume", target=run_id, detail=f"job={job_id}")
         return JSONResponse({"job_id": job_id})
@@ -380,7 +384,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                   store: SecretStore = Depends(get_store),
                   user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, request.headers.get("x-csrf-token"))
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         spec_path = run_dir / "spec.yaml"
         if not spec_path.exists():
             raise HTTPException(404, "run/spec not found")
@@ -528,7 +532,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/runs/{run_id}/report", response_class=HTMLResponse)
     def run_report(run_id: str, request: Request, regen: int = 0,
                    user: sqlite3.Row = Depends(require("viewer"))) -> Response:
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
         out = run_dir / harness_api.report_filename(run_dir)
@@ -538,7 +542,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
 
     @app.get("/runs/{run_id}/report/download")
     def run_report_download(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         out = run_dir / harness_api.report_filename(run_dir)
         if not out.exists():
             out = harness_api.generate_report(run_dir)
@@ -548,7 +552,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/api/runs/{run_id}/summary")
     def api_run_summary(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
         """Parsed run data for the interactive in-app report (manifest + summary)."""
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
         manifest = _manifest(run_dir)          # tolerant of a malformed manifest
@@ -574,7 +578,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         rel = _CSV_FILES.get(which)
         if rel is None:
             raise HTTPException(400, f"unknown csv '{which}'")
-        p = cfg.results_dir / run_id / rel
+        p = _run_dir_safe(cfg, run_id) / rel
         if not p.exists():
             raise HTTPException(404, "no such data for this run")
         return Response(p.read_text(encoding="utf-8"), media_type="text/csv",
@@ -582,15 +586,15 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
 
     @app.get("/runs/{run_id}/spec")
     def run_spec(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
-        p = cfg.results_dir / run_id / "spec.yaml"
+        p = _run_dir_safe(cfg, run_id) / "spec.yaml"
         if not p.exists():
             raise HTTPException(404, "spec not found")
         return PlainTextResponse(p.read_text(encoding="utf-8"))
 
     @app.get("/runs/{run_id}/artifact")
     def run_artifact(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
-        run_dir = cfg.results_dir / run_id
-        if not run_dir.exists():
+        run_dir = _run_dir_safe(cfg, run_id)
+        if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -602,7 +606,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/runs/{run_id}/stream")
     def run_stream(run_id: str, conn: sqlite3.Connection = Depends(get_conn),
                    user: sqlite3.Row = Depends(require("viewer"))) -> StreamingResponse:
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)
         return StreamingResponse(_sse(cfg, run_dir), media_type="text/event-stream")
 
     @app.delete("/api/runs/{run_id}")
@@ -875,12 +879,21 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         if not man.exists():
             raise HTTPException(404, "run not found")
         m = json.loads(man.read_text())
+        start_epoch = _epoch(m.get("created_utc"))
+        finished_epoch = _epoch(m.get("finished_utc"))
+        # An in-progress run has no finished_utc yet (epoch 0), which would request
+        # an inverted [start, 0] window. Fall back to "now" so live runs still get a
+        # valid window — and only cache once the run is terminal, since a mid-run
+        # window is partial and must not be frozen as the final provider metrics.
+        terminal = m.get("status") in ("complete", "partial", "failed", "canceled")
+        end_epoch = finished_epoch or int(time.time())
         data = provider.fetch_metrics(conn, store, queries.get_setting(conn, "do_cluster_id", ""),
-                                      _epoch(m.get("created_utc")), _epoch(m.get("finished_utc")))
+                                      start_epoch, end_epoch)
         if data is None:
             return JSONResponse({"available": False, "reason": "provider fetch failed"})
-        cached.parent.mkdir(parents=True, exist_ok=True)
-        cached.write_text(json.dumps(data))
+        if terminal and finished_epoch:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_text(json.dumps(data))
         return JSONResponse(data)
 
     # ── SPA shell (served under /ui/*; assets via the /static mount) ──
@@ -945,6 +958,22 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
         yield _event("progress", _progress(run_dir, budget_s))
         status = _run_status(run_dir)
         if status in ("complete", "partial", "failed", "canceled"):
+            # Final drain before `done`: the harness writes its last log lines and
+            # the terminal manifest status in the same instant, so bytes can land
+            # AFTER this tick's reads above. Re-read log (incl. a trailing partial
+            # line), samples and pg so the cockpit never loses the final fragment.
+            if log.exists():
+                chunk, sent_log = _read_tail(log, sent_log, include_partial=True)
+                if chunk:
+                    yield _event("log", chunk)
+            rel, header, data = _read_samples(run_dir)
+            if rel is not None and rel == cur_file and len(data) > sent_rows:
+                yield _event("samples", {"file": rel, "header": header,
+                                         "offset": sent_rows, "rows": data[sent_rows:]})
+            pg_header, pg_data = _read_csv(run_dir / "parsed" / "pg_timeseries.csv")
+            if pg_header and len(pg_data) > pg_sent:
+                yield _event("pg", {"header": pg_header, "offset": pg_sent,
+                                    "rows": pg_data[pg_sent:]})
             yield _event("done", {"status": status})
             return
         time.sleep(1)
@@ -1119,12 +1148,16 @@ def _progress(run_dir: Path, budget_s: int) -> dict:
             "levels_total": len(levels), "levels_done": done, "current": current}
 
 
-def _read_tail(path: Path, offset: int) -> tuple[str, int]:
+def _read_tail(path: Path, offset: int, include_partial: bool = False) -> tuple[str, int]:
     """Read complete new lines past *offset* bytes (incremental log streaming).
 
     Returns (text, new_offset). Avoids re-reading the whole (potentially huge,
     multi-hour) log each tick; only emits up to the last newline so a partial
     in-progress line waits for its terminator.
+
+    On the terminal flush (``include_partial=True``) the process has exited and
+    will write no more, so emit everything past the offset — including a trailing
+    line with no newline — otherwise the cockpit loses the final log fragment.
     """
     try:
         with open(path, "rb") as fh:
@@ -1132,6 +1165,10 @@ def _read_tail(path: Path, offset: int) -> tuple[str, int]:
             data = fh.read()
     except OSError:
         return "", offset
+    if include_partial:
+        if not data:
+            return "", offset
+        return data.decode("utf-8", "replace"), offset + len(data)
     nl = data.rfind(b"\n")
     if nl == -1:
         return "", offset
