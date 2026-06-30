@@ -273,11 +273,27 @@ def cmd_prepare(spec_path: Path, results_dir: Path, recreate: str = "",
             ok, err = capture.create_database(spec, password, maint)
             if not ok:
                 raise RunError(f"CREATE DATABASE {db} failed: {err}")
-            capture.wait_for_db(spec, password)
+            # Don't proceed to load against a cluster that isn't reachable yet:
+            # a created DB can lag before it accepts connections on managed PG.
+            if not capture.wait_for_db(spec, password):
+                raise RunError(
+                    f"database '{db}' was created but is not reachable yet",
+                    hint="managed PG can lag just after a create — retry prepare.")
         else:
             raise RunError(
                 f"database '{db}' does not exist on {spec.target.host}",
                 hint="re-run prepare with 'create database' enabled to create it first.")
+    elif maint is None and not capture.wait_for_db(spec, password, attempts=1):
+        # No maintenance database (defaultdb/postgres) was reachable, so we could
+        # neither verify nor create the target — AND the target itself does not
+        # answer. Report this explicitly instead of falling through to check_dataset
+        # and surfacing a generic connectivity error with no actionable cause.
+        raise RunError(
+            f"cannot reach a maintenance database to create '{db}', and '{db}' "
+            f"itself is not reachable on {spec.target.host}",
+            hint=("creating a database needs a reachable maintenance DB where the "
+                  "user has CREATEDB; check credentials/SSL." if create_db
+                  else "check credentials/SSL and that the database exists."))
 
     check = capture.check_dataset(spec, password)
     if check.ok and not recreate:
@@ -669,13 +685,17 @@ def _soak_supervisor(
             manifest.soak = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
             manifest.save(run_dir)
             total_intervals += n_intervals
-            # Decoupled from total_intervals: a single stray interval line in any one
-            # segment must NOT permanently disable the zero-sample cutoff.
             consecutive_zero_sample = consecutive_zero_sample + 1 if n_intervals == 0 else 0
             consecutive_short = consecutive_short + 1 if seg_wall < min(5, remaining) else 0
             if rc == 0 and time.monotonic() >= deadline - 1:
                 break  # completed the window cleanly
-            if consecutive_zero_sample >= soak.fast_fail_segments:
+            # The fast-fail / churn guards apply ONLY before the soak has produced
+            # any samples (total_intervals == 0) — i.e. a load generator that is
+            # broken from the start. Once it HAS produced samples, zero-sample or
+            # short segments are an OUTAGE to ride through (the whole point of a
+            # failover soak); the per-segment timeout + hard ceiling + deadline +
+            # max_relaunches bound it without truncating the test.
+            if total_intervals == 0 and consecutive_zero_sample >= soak.fast_fail_segments:
                 raise RunError(
                     f"soak produced no samples in {consecutive_zero_sample} consecutive launches "
                     f"at {soak.threads} threads — the load generator cannot sustain load against "
@@ -686,9 +706,9 @@ def _soak_supervisor(
                             "that the target accepts this concurrency. NOTE: preflight's idle-holder "
                             "ceiling probe passing does not guarantee tpcc's heavier per-thread init "
                             "succeeds at this thread count."))
-            if consecutive_short >= 15:
+            if total_intervals == 0 and consecutive_short >= 15:
                 logger.error("soak: load generator exited almost immediately %d times in a "
-                             "row; stopping to avoid a relaunch hot-loop.", consecutive_short)
+                             "row without ever producing a sample; stopping.", consecutive_short)
                 break
             if relaunches >= soak.max_relaunches:
                 logger.error("soak: reached max_relaunches=%d; stopping early.", soak.max_relaunches)
