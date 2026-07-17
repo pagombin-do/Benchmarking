@@ -36,9 +36,13 @@ OPS_KINDS: dict[str, str] = {
     "ops_diag": "diag",
     "ops_health": "health",
     "ops_operate": "operate",
+    "ops_pmm_enable": "pmm-enable",
+    "ops_pmm_status": "pmm-status",
+    "ops_pmm_disable": "pmm-disable",
 }
 RUN_DIR_KINDS = ("ops_cr_apply", "ops_backup", "ops_scenario", "ops_monitor",
-                 "ops_diag", "ops_operate")
+                 "ops_diag", "ops_operate", "ops_pmm_enable", "ops_pmm_status",
+                 "ops_pmm_disable")
 
 SUMMARY_MARKER = "OPS_SUMMARY_JSON"
 TOPOLOGY_MARKER = "OPS_TOPOLOGY_JSON"
@@ -373,7 +377,8 @@ def maybe_enqueue_auto_health(cfg: Config, conn: sqlite3.Connection) -> int:
         # transition alerts. Wait for the destructive op to finish.
         if queries.active_ops_jobs(conn, kt["id"],
                                    ("ops_health", "ops_scenario", "ops_backup",
-                                    "ops_cr_apply", "ops_operate")):
+                                    "ops_cr_apply", "ops_operate",
+                                    "ops_pmm_enable", "ops_pmm_disable")):
             continue
         from pgbench_webapp.ops_routes import build_ops_spec_yaml
         spec_yaml = build_ops_spec_yaml(kt, "health", {},
