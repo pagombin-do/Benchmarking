@@ -340,6 +340,36 @@ def test_suite_high_iops_marker_is_surfaced(iops_env, monkeypatch):
     assert "high-IOPS/QoS markers present" in ident["finding"]
 
 
+def test_soak_compare_report_has_context_and_settings(iops_env):
+    """Soak-vs-soak comparison (the DO-vs-Aiven workhorse): identity cards,
+    fairness verdict, latency/error overlays, key + full settings."""
+    from pgbench_harness.compare import generate_soak_compare
+    results = iops_env / "results"
+    doc = make_spec_doc()
+    del doc["sweep"]
+    doc["soak"] = {"threads": 4, "duration_s": 3}
+    spec_path = iops_env / "soak.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("soak", "--spec", str(spec_path),
+                   "--results-dir", str(results)) in (0, 1)
+    assert run_cli("soak", "--spec", str(spec_path),
+                   "--results-dir", str(results)) in (0, 1)
+    dirs = sorted(d for d in results.iterdir()
+                  if (d / "manifest.json").exists())
+    assert len(dirs) == 2
+    out = iops_env / "soak_compare.html"
+    generate_soak_compare(dirs, out)
+    html = out.read_text()
+    assert "Environment &amp; identity" in html
+    assert "Comparability check" in html
+    assert "Fair comparison" in html               # identical specs
+    assert "Key database settings" in html
+    assert "Full pg_settings capture" in html
+    assert "p99 latency over time" in html
+    assert "median TPS" in html                    # two-run delta note
+    assert "table-wrap" in html
+
+
 # ── e2e: rate-stepped soak against an obviously-not-pressured device ──
 
 def test_rate_stepped_soak_inconclusive_verdict(iops_env, monkeypatch):
@@ -625,6 +655,82 @@ def test_device_probe_direct_io_flag():
     assert "--file-extra-flags=direct" in args
     doc["device_probe"] = {"allow_device_probe": True}
     assert "--file-extra-flags=direct" not in _fileio_args(parse_spec(doc))
+
+
+def test_evidence_pack_e2e(iops_env, monkeypatch):
+    """The one-click pack: four probes as one job, individually browsable
+    child runs, a consolidated narrative with fresh numbers, and cleanup."""
+    monkeypatch.setenv("FAKE_KUBE_DEV_IOPS", "7600")
+    monkeypatch.setenv("FAKE_KUBE_DEV_UTIL", "99")
+    results = iops_env / "results"
+    doc = make_spec_doc()
+    del doc["sweep"]
+    doc["cluster"] = {"cr_name": "cluster1"}
+    doc["device_probe"] = {"allow_device_probe": True, "pack": True,
+                           "duration_s": 2, "file_total_size_gb": 1,
+                           "file_num": 8, "threads": 4}
+    spec_path = iops_env / "pack.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("evidence-pack", "--spec", str(spec_path), "--dry-run") == 0
+    rc = run_cli("evidence-pack", "--spec", str(spec_path),
+                 "--results-dir", str(results))
+    assert rc == 0
+    pack_dir = next(d for d in results.iterdir() if d.is_dir()
+                    and json.loads((d / "manifest.json").read_text()
+                                   ).get("mode") == "pack")
+    man = json.loads((pack_dir / "manifest.json").read_text())
+    assert man["mode"] == "pack" and man["status"] == "complete"
+    children = json.loads(
+        (pack_dir / "parsed" / "pack_children.json").read_text())
+    assert len(children) == 4
+    assert all(c["exit_code"] in (0, 1) and c["run_id"] for c in children)
+    # each child is a real, individually browsable probe run
+    for c in children:
+        assert (results / c["run_id"] / "evidence.json").exists()
+    # the narrative carries fresh numbers and the analysis skeleton
+    md = (pack_dir / "pack_report.md").read_text()
+    assert "IOPS evidence pack" in md
+    assert "Replication" in md and "%" in md
+    assert "rndrd-8k" in md and "rndwr-16k-repl" in md
+    assert "volume_id" in md or "backend volume_id" in md
+    assert (pack_dir / "report.html").exists()
+    ev = json.loads((pack_dir / "evidence.json").read_text())
+    assert ev["verdict"]["finding"] in ("capped", "exceeds", "inconclusive")
+    assert len(ev["children"]) == 4
+    # files cleaned up at the end (keep_files not set)
+    st = json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+    assert st.get("probe_files") is False
+
+
+def test_evidence_pack_continues_past_a_failed_child(iops_env, monkeypatch):
+    """A dead probe is a hole in the evidence, not the end of the pack."""
+    monkeypatch.setenv("FAKE_KUBE_DEV_IOPS", "7600")
+    monkeypatch.setenv("FAKE_KUBE_DEV_UTIL", "99")
+    monkeypatch.setenv("FAKE_KUBE_FILEIO_RUN_RC", "1")   # every run exec dies
+    results = iops_env / "results"
+    doc = make_spec_doc()
+    del doc["sweep"]
+    doc["cluster"] = {"cr_name": "cluster1"}
+    doc["device_probe"] = {"allow_device_probe": True, "pack": True,
+                           "duration_s": 2, "file_total_size_gb": 1,
+                           "file_num": 8, "threads": 4}
+    spec_path = iops_env / "pack.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    rc = run_cli("evidence-pack", "--spec", str(spec_path),
+                 "--results-dir", str(results))
+    # every child died instantly with no evidence -> an honest terminal code,
+    # but never a crash: the pack still finalizes, attempts all four, and
+    # writes the narrative recording what happened
+    assert rc in (0, 1, 2)
+    pack_dir = next(d for d in results.iterdir() if d.is_dir()
+                    and json.loads((d / "manifest.json").read_text()
+                                   ).get("mode") == "pack")
+    children = json.loads(
+        (pack_dir / "parsed" / "pack_children.json").read_text())
+    assert len(children) == 4    # all four attempted despite failures
+    assert (pack_dir / "pack_report.md").exists()
+    man = json.loads((pack_dir / "manifest.json").read_text())
+    assert man["status"] in ("partial", "failed")   # terminal, not stuck
 
 
 def test_probe_summary_falls_back_to_device_series(tmp_path):
