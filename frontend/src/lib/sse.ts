@@ -7,7 +7,6 @@ export interface Hello {
   mode: string;
   status: string;
   budget_s: number;
-  budget_breakdown?: string;   // how the budget is built, e.g. "4 thread levels × 5:00 each + 3×0:30 cooldown"
   start_utc: string;   // run t=0 wall-clock anchor (soak load start, else created) for alignment
 }
 
@@ -123,7 +122,10 @@ export function emptySeries(): Series {
 export function appendBatch(s: Series, batch: SampleBatch): void {
   const cols = batch.header.split(",");
   const ix = (name: string) => cols.indexOf(name);
-  const it = ix("t_offset") >= 0 ? ix("t_offset") : ix("t");
+  // Prefer t_wall (seconds since RUN start): t_offset restarts per sweep
+  // level, which stacked a 10-level sweep into one duration-wide window.
+  const iwall = ix("t_wall");
+  const ioff = ix("t_offset") >= 0 ? ix("t_offset") : ix("t");
   const itps = ix("tps"), iqps = ix("qps"), ip99 = ix("lat_p99");
   const ierr = ix("err_s"), irec = ix("reconn_s");
   const ir = ix("r") >= 0 ? ix("r") : ix("qps_r");   // sweep samples.csv: r/w/o; soak: qps_r/w/o
@@ -131,7 +133,10 @@ export function appendBatch(s: Series, batch: SampleBatch): void {
   const io = ix("o") >= 0 ? ix("o") : ix("qps_o");
   for (const line of batch.rows) {
     const f = line.split(",");
-    const t = parseFloat(f[it]);
+    // per-row fallback: a blank t_wall (legacy rows, missing anchor) must
+    // fall back to the level offset, never drop the sample
+    const tw = iwall >= 0 ? parseFloat(f[iwall]) : NaN;
+    const t = Number.isNaN(tw) ? parseFloat(f[ioff]) : tw;
     if (Number.isNaN(t)) continue;
     s.t.push(t);
     s.tps.push(num(f[itps]));
@@ -257,31 +262,6 @@ export interface OpsStreamHandlers {
   onProgress?: (p: { status: string }) => void;
   onDone?: (d: { status: string }) => void;
   onError?: () => void;
-}
-
-// ── live log viewer (logs op) ───────────────────────────────────────────
-
-export interface LogSource { pod: string; container: string; category: string; file: string }
-
-export interface LogsStreamHandlers {
-  onHello?: (h: { op_run_id: string; status: string; sources: LogSource[] | null }) => void;
-  onSources?: (s: LogSource[]) => void;
-  onLines?: (b: { file: string; lines: string[] }) => void;
-  onDone?: (d: { status: string }) => void;
-  onError?: () => void;
-}
-
-export function openLogsStream(opRunId: string, h: LogsStreamHandlers): EventSource {
-  const es = new EventSource(`/ops/runs/${encodeURIComponent(opRunId)}/logs-stream`);
-  es.addEventListener("hello", (e) => h.onHello?.(JSON.parse((e as MessageEvent).data)));
-  es.addEventListener("sources", (e) => h.onSources?.(JSON.parse((e as MessageEvent).data)));
-  es.addEventListener("lines", (e) => h.onLines?.(JSON.parse((e as MessageEvent).data)));
-  es.addEventListener("done", (e) => {
-    h.onDone?.(JSON.parse((e as MessageEvent).data));
-    es.close();
-  });
-  es.onerror = () => h.onError?.();
-  return es;
 }
 
 export function openOpsStream(opRunId: string, h: OpsStreamHandlers): EventSource {

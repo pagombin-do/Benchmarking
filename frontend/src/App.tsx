@@ -21,7 +21,6 @@ import { KubeTargetView } from "./pages/KubeTargetView";
 import { KubeParams } from "./pages/KubeParams";
 import { KubeDiag } from "./pages/KubeDiag";
 import { KubeOperate } from "./pages/KubeOperate";
-import { KubeLogs } from "./pages/KubeLogs";
 import { OpsRuns } from "./pages/OpsRuns";
 import { OpsRunView } from "./pages/OpsRunView";
 import { OpsCompare } from "./pages/OpsCompare";
@@ -64,7 +63,6 @@ export function App() {
           <Route path="/ops/targets/:targetId/params" element={<KubeParams me={me} />} />
           <Route path="/ops/targets/:targetId/diag" element={<KubeDiag me={me} />} />
           <Route path="/ops/targets/:targetId/operate" element={<KubeOperate me={me} />} />
-          <Route path="/ops/targets/:targetId/logs" element={<KubeLogs me={me} />} />
           <Route path="/ops/runs" element={<OpsRuns />} />
           <Route path="/ops/runs/:opRunId" element={<OpsRunView />} />
           <Route path="/ops/compare" element={<OpsCompare />} />
