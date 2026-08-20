@@ -91,24 +91,8 @@ def default_state():
     # pg_stat_monitor via the built-in extensions toggle (independent of
     # shared_preload_libraries) — so Validate rejects until it's switched off.
     if os.environ.get("FAKE_KUBE_BUILTIN_PGSM"):
-        state["cr"]["spec"]["extensions"] = {"builtin": {"pg_stat_monitor": True}}
+        state["cr"]["spec"]["extensions"] = {"builtin": {"pgStatMonitor": True}}
     return state
-
-
-# The CRD declares spec.extensions.builtin as a structural object with exactly
-# these properties, so the API server PRUNES any other key instead of storing it
-# (a camelCase pgStatMonitor patch reports success and changes nothing). Model
-# that here: a patch spelling the toggle wrong must not flip it, or the fixture
-# silently blesses a spelling the real cluster drops on the floor.
-_BUILTIN_KEYS = {"pg_audit", "pg_repack", "pg_stat_monitor",
-                 "pg_stat_statements", "pgvector"}
-
-
-def prune_builtin(cr):
-    builtin = (((cr.get("spec") or {}).get("extensions") or {}).get("builtin"))
-    if isinstance(builtin, dict):
-        for k in [k for k in builtin if k not in _BUILTIN_KEYS]:
-            del builtin[k]
 
 
 def load():
@@ -1324,7 +1308,6 @@ def main():
         # runs against the POST-merge CR and rejects if both end up enabled.
         merged_cr = json.loads(json.dumps(st["cr"]))
         deep_merge(merged_cr, patch)
-        prune_builtin(merged_cr)
         spl_v = str(((((((merged_cr.get("spec") or {}).get("patroni") or {})
                       .get("dynamicConfiguration") or {}).get("postgresql")
                       or {}).get("parameters") or {})
@@ -1332,9 +1315,9 @@ def main():
         spl_toks = {p.strip().strip("'\"").strip() for p in spl_v.split(",")}
         builtin = ((((merged_cr.get("spec") or {}).get("extensions") or {})
                     .get("builtin")) or {})
-        pgsm_on = "pg_stat_monitor" in spl_toks or bool(builtin.get("pg_stat_monitor"))
+        pgsm_on = "pg_stat_monitor" in spl_toks or bool(builtin.get("pgStatMonitor"))
         pgss_on = ("pg_stat_statements" in spl_toks
-                   or bool(builtin.get("pg_stat_statements")))
+                   or bool(builtin.get("pgStatStatements")))
         if pgsm_on and pgss_on:
             sys.stderr.write(
                 "admission webhook denied the request: "
@@ -1343,7 +1326,6 @@ def main():
             return 1
 
         deep_merge(st["cr"], patch)
-        prune_builtin(st["cr"])
         if ((patch.get("spec") or {}).get("pmm") or {}).get("enabled"):
             # the operator rolls the instance pods one at a time
             st["pmm_roll"] = {i["name"]: now() + ROLL_S * (k + 1)
